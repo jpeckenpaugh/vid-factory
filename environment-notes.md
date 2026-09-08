@@ -38,6 +38,12 @@ The POC vendors the pinned `sql.js` 1.13.0 JavaScript and WebAssembly runtime
 under `browser-edition/vendor/sql.js/`; no Node.js toolchain, package installation,
 or runtime CDN access is required.
 
+Sprint 2 enhancements for AI script generation (Gemini, OpenAI, Ollama) and speech
+synthesis (`kokoro-js` WebAssembly / WebGPU) execute entirely client-side in the
+browser. No backend speech generation endpoints or Python LLM packages are needed.
+Model weights and synthesized audio binary tracks are cached locally in browser storage
+(IndexedDB / OPFS).
+
 ## Caveats
 
 - `run.sh` intentionally cannot start until Stage 6 supplies the agreed backend
