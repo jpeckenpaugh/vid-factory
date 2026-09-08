@@ -13,23 +13,9 @@ class TTSError extends Error {
   }
 }
 
-// Generate a valid, playable 16-bit mono PCM WAV audio buffer as fallback
-function generateSyntheticWav(text, voiceId, speed = 1.0, sampleRate = DEFAULT_SAMPLE_RATE) {
-  // Pitch frequencies for voices (Hz)
-  const voicePitches = {
-    af_heart: 220,
-    af_bella: 260,
-    am_adam: 130,
-    am_michael: 150,
-  };
-  const basePitch = voicePitches[voiceId] || 200;
-
-  // Estimate duration from character count & speed factor
-  const charCount = Math.max(1, text.trim().length);
-  const baseDurationSeconds = Math.max(0.8, charCount / 12);
-  const durationSeconds = baseDurationSeconds / speed;
-
-  const numSamples = Math.floor(sampleRate * durationSeconds);
+// Convert 32-bit float PCM array to a 16-bit mono PCM WAV ArrayBuffer
+function pcmFloatToWavBuffer(float32Samples, sampleRate = DEFAULT_SAMPLE_RATE) {
+  const numSamples = float32Samples.length;
   const dataSize = numSamples * 2; // 16-bit PCM (2 bytes per sample)
   const buffer = new ArrayBuffer(44 + dataSize);
   const view = new DataView(buffer);
@@ -62,35 +48,182 @@ function generateSyntheticWav(text, voiceId, speed = 1.0, sampleRate = DEFAULT_S
   // Subchunk2Size
   view.setUint32(40, dataSize, true);
 
-  // Synthesize tone cadence with attack/decay envelope
   let byteOffset = 44;
   for (let i = 0; i < numSamples; i++) {
-    const t = i / sampleRate;
-
-    // Cadence modulation based on speech phrasing
-    const phraseMod = Math.sin(2 * Math.PI * 3 * t);
-    const currentPitch = basePitch + phraseMod * 20;
-
-    // Harmonic wave
-    const wave = Math.sin(2 * Math.PI * currentPitch * t) + 0.3 * Math.sin(2 * Math.PI * currentPitch * 2 * t);
-
-    // Envelope (fade in 0.05s, fade out 0.05s)
-    let envelope = 1.0;
-    if (t < 0.05) envelope = t / 0.05;
-    else if (t > durationSeconds - 0.05) envelope = Math.max(0, (durationSeconds - t) / 0.05);
-
-    const sample = Math.max(-1, Math.min(1, wave * envelope * 0.4));
-    const int16 = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-
+    const s = Math.max(-1, Math.min(1, float32Samples[i]));
+    const int16 = s < 0 ? s * 0x8000 : s * 0x7fff;
     view.setInt16(byteOffset, int16, true);
     byteOffset += 2;
   }
 
+  const duration = parseFloat((numSamples / sampleRate).toFixed(2));
   return {
     buffer,
-    duration: parseFloat(durationSeconds.toFixed(2)),
+    duration,
     sample_rate: sampleRate,
   };
+}
+
+// Generate articulated dialogue speech audio WAV buffer using formant frequency synthesis & speech prosody
+function generateSyntheticWav(text, voiceId, speed = 1.0, sampleRate = DEFAULT_SAMPLE_RATE) {
+  const voicePitches = {
+    af_heart: 220,
+    af_bella: 260,
+    am_adam: 130,
+    am_michael: 150,
+  };
+  const basePitch = voicePitches[voiceId] || 200;
+  const isFemale = voiceId.startsWith("af_");
+
+  const vowelFormants = {
+    a: [700, 1200, 2600],
+    e: [500, 1800, 2500],
+    i: [300, 2200, 3000],
+    o: [400, 800, 2400],
+    u: [320, 800, 2200],
+  };
+  if (isFemale) {
+    for (const v in vowelFormants) {
+      vowelFormants[v] = vowelFormants[v].map((f) => Math.round(f * 1.15));
+    }
+  }
+
+  const rawText = text.trim() || "Hello world";
+  const words = rawText.split(/\s+/);
+
+  const segments = [];
+  let isQuestion = rawText.endsWith("?");
+
+  for (let wIdx = 0; wIdx < words.length; wIdx++) {
+    const rawWord = words[wIdx];
+    const word = rawWord.toLowerCase().replace(/[^a-z]/g, "");
+    const hasComma = rawWord.includes(",");
+    const hasPeriod = rawWord.includes(".") || rawWord.includes("!") || rawWord.includes("?");
+
+    if (!word) {
+      segments.push({ type: "pause", duration: 0.1 });
+      continue;
+    }
+
+    const chars = word.split("");
+    let currentSyllable = [];
+
+    for (let cIdx = 0; cIdx < chars.length; cIdx++) {
+      const char = chars[cIdx];
+      currentSyllable.push(char);
+
+      const isVowel = "aeiouy".includes(char);
+      const isNextVowel = cIdx < chars.length - 1 && "aeiouy".includes(chars[cIdx + 1]);
+
+      if (isVowel || (!isNextVowel && currentSyllable.length >= 3) || cIdx === chars.length - 1) {
+        segments.push({
+          type: "speech",
+          wordIndex: wIdx,
+          totalWords: words.length,
+          chars: currentSyllable.join(""),
+          hasVowel: currentSyllable.some((c) => "aeiouy".includes(c)),
+          vowelChar: currentSyllable.find((c) => "aeiouy".includes(c)) || "a",
+          hasFricative: currentSyllable.some((c) => "sfxzthkpcsh".includes(c)),
+        });
+        currentSyllable = [];
+      }
+    }
+
+    const pauseDur = hasPeriod ? 0.25 : hasComma ? 0.15 : 0.08;
+    segments.push({ type: "pause", duration: pauseDur });
+  }
+
+  const baseSyllableDuration = 0.14 / speed;
+  let totalDuration = 0;
+  for (const seg of segments) {
+    if (seg.type === "pause") {
+      seg.duration = seg.duration / speed;
+    } else {
+      seg.duration = Math.max(0.08, (seg.chars.length * 0.045 + baseSyllableDuration) / speed);
+    }
+    seg.startTime = totalDuration;
+    totalDuration += seg.duration;
+  }
+
+  if (totalDuration < 0.8) {
+    totalDuration = 0.8;
+  }
+
+  const numSamples = Math.floor(sampleRate * totalDuration);
+  const floatSamples = new Float32Array(numSamples);
+
+  let segIdx = 0;
+  let phaseAcc = 0;
+
+  for (let i = 0; i < numSamples; i++) {
+    const t = i / sampleRate;
+
+    while (segIdx < segments.length - 1 && t >= segments[segIdx].startTime + segments[segIdx].duration) {
+      segIdx++;
+    }
+    const seg = segments[segIdx];
+
+    if (!seg || seg.type === "pause" || t >= segments[segments.length - 1].startTime + segments[segments.length - 1].duration) {
+      floatSamples[i] = 0;
+      continue;
+    }
+
+    const segT = (t - seg.startTime) / seg.duration;
+
+    const wordProgress = seg.wordIndex / Math.max(1, seg.totalWords - 1);
+    let intonation = 1.0 - wordProgress * 0.12;
+
+    if (isQuestion && wordProgress > 0.7) {
+      intonation += (wordProgress - 0.7) * 0.4;
+    }
+
+    const stressArc = Math.sin(Math.PI * segT) * 0.06;
+    const currentF0 = basePitch * (intonation + stressArc);
+
+    phaseAcc += currentF0 / sampleRate;
+    if (phaseAcc >= 1.0) phaseAcc -= 1.0;
+
+    let glottalSource = 0;
+    if (seg.hasVowel) {
+      if (phaseAcc < 0.6) {
+        glottalSource = 0.5 * (1 - Math.cos((Math.PI * phaseAcc) / 0.6));
+      } else {
+        glottalSource = Math.cos((Math.PI * (phaseAcc - 0.6)) / 0.8);
+      }
+    } else {
+      glottalSource = Math.sin(2 * Math.PI * phaseAcc);
+    }
+
+    const formants = vowelFormants[seg.vowelChar] || vowelFormants["a"];
+    const [f1, f2, f3] = formants;
+
+    const formantResonance =
+      Math.sin(2 * Math.PI * f1 * t) * 0.5 +
+      Math.sin(2 * Math.PI * f2 * t) * 0.3 +
+      Math.sin(2 * Math.PI * f3 * t) * 0.15;
+
+    let fricativeNoise = 0;
+    if (seg.hasFricative && (segT < 0.25 || segT > 0.75)) {
+      const rawNoise = Math.random() * 2 - 1;
+      fricativeNoise = rawNoise * 0.35;
+    }
+
+    let sample = glottalSource * formantResonance * 0.7 + fricativeNoise;
+
+    let envelope = 1.0;
+    if (segT < 0.15) {
+      envelope = segT / 0.15;
+    } else if (segT > 0.8) {
+      envelope = (1.0 - segT) / 0.2;
+    }
+
+    if (t < 0.03) envelope *= t / 0.03;
+    else if (t > totalDuration - 0.03) envelope *= Math.max(0, (totalDuration - t) / 0.03);
+
+    floatSamples[i] = Math.max(-1, Math.min(1, sample * envelope * 0.5));
+  }
+
+  return pcmFloatToWavBuffer(floatSamples, sampleRate);
 }
 
 function postProgress(status, progress, text) {
@@ -107,13 +240,41 @@ async function initializeTTS() {
 
   try {
     postProgress("loading_model", 0.1, "Checking Kokoro TTS engine...");
-    // Attempt dynamic import or ONNX setup if available in environment
-    postProgress("loading_model", 0.5, "Initializing WebAssembly speech model...");
+    postProgress("loading_model", 0.3, "Loading kokoro-js WebAssembly engine...");
+
+    let KokoroTTS;
+    try {
+      const module = await import("https://cdn.jsdelivr.net/npm/kokoro-js");
+      KokoroTTS = module.KokoroTTS || module.default?.KokoroTTS;
+    } catch (importErr) {
+      if (typeof self.KokoroTTS !== "undefined") {
+        KokoroTTS = self.KokoroTTS;
+      } else {
+        throw importErr;
+      }
+    }
+
+    if (!KokoroTTS) {
+      throw new Error("KokoroTTS module unavailable.");
+    }
+
+    postProgress("loading_model", 0.5, "Initializing WebAssembly speech model weights...");
+    kokoroModel = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-ONNX", {
+      dtype: "q8",
+      device: "wasm",
+      progress_callback: (progress) => {
+        if (progress?.status === "progress" && progress.total) {
+          const ratio = 0.5 + (progress.loaded / progress.total) * 0.4;
+          postProgress("loading_model", parseFloat(ratio.toFixed(2)), `Loading model weights: ${progress.file || ''}`);
+        }
+      }
+    });
+
     postProgress("loading_model", 1.0, "TTS Engine Ready.");
-    kokoroModel = { ready: true };
     return true;
   } catch (error) {
     modelFailed = true;
+    kokoroModel = null;
     postProgress("loading_model", 1.0, "Using synthetic offline speech generator fallback.");
     return false;
   } finally {
@@ -137,17 +298,44 @@ async function synthesizeSpeech(payload) {
     throw new TTSError("validation_error", "Speed must be between 0.75 and 1.25.");
   }
 
-  postProgress("synthesizing", 0.25, "Processing script text & phonemes...");
-  await new Promise((r) => setTimeout(r, 50));
+  postProgress("synthesizing", 0.15, "Processing script text & phonemes...");
+
+  if (!kokoroModel && !modelFailed) {
+    await initializeTTS();
+  }
+
+  if (kokoroModel && typeof kokoroModel.generate === "function") {
+    try {
+      postProgress("synthesizing", 0.4, "Synthesizing dialogue audio with Kokoro TTS model...");
+      const audioResult = await kokoroModel.generate(text, { voice: voiceId, speed });
+      postProgress("synthesizing", 0.85, "Encoding audio buffer...");
+
+      let floatSamples = null;
+      let sRate = DEFAULT_SAMPLE_RATE;
+
+      if (audioResult?.audio instanceof Float32Array) {
+        floatSamples = audioResult.audio;
+        sRate = audioResult.sampling_rate || DEFAULT_SAMPLE_RATE;
+      } else if (audioResult instanceof Float32Array) {
+        floatSamples = audioResult;
+      }
+
+      if (floatSamples) {
+        const wavRes = pcmFloatToWavBuffer(floatSamples, sRate);
+        postProgress("synthesizing", 1.0, "Audio synthesis complete.");
+        return {
+          audio_blob: wavRes.buffer,
+          duration: wavRes.duration,
+          sample_rate: wavRes.sample_rate,
+        };
+      }
+    } catch (err) {
+      console.warn("Kokoro model inference failed, falling back to speech generator:", err);
+    }
+  }
 
   postProgress("synthesizing", 0.65, "Synthesizing dialogue audio waveform...");
-  await new Promise((r) => setTimeout(r, 50));
-
-  postProgress("synthesizing", 0.9, "Encoding audio buffer...");
-
-  // Generate synthetic WAV audio (or model audio)
   const result = generateSyntheticWav(text, voiceId, speed);
-
   postProgress("synthesizing", 1.0, "Audio synthesis complete.");
 
   return {
