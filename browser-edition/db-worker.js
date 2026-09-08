@@ -7,8 +7,10 @@ const FORMAT_ID = "video-content-factory-workspace";
 const FORMAT_VERSION = 1;
 const APPLICATION_SEEDS = ["YouTube", "TikTok", "Instagram"];
 const COMPANY_SEEDS = ["Acme Studio", "Northstar Media", "Pine & Peak"];
-const REQUIRED_TABLES = ["applications", "companies", "content_projects", "drafts", "workspace_meta"];
-const REQUIRED_INDEXES = ["idx_content_projects_application_id", "idx_content_projects_company_id"];
+const REQUIRED_TABLES = ["applications", "companies", "content_projects", "drafts", "workspace_meta", "ai_settings", "audio_tracks"];
+const REQUIRED_INDEXES = ["idx_content_projects_application_id", "idx_content_projects_company_id", "idx_audio_tracks_content_project_id"];
+const SUPPORTED_PROVIDERS = ["Gemini", "OpenAI", "Ollama"];
+
 
 let SQL;
 let db;
@@ -101,8 +103,26 @@ function createSchema(target) {
     format_id TEXT NOT NULL CHECK (format_id = '${FORMAT_ID}'),
     format_version INTEGER NOT NULL CHECK (format_version = ${FORMAT_VERSION})
   );`);
+  target.run(`CREATE TABLE ai_settings (
+    provider TEXT PRIMARY KEY CHECK (provider IN ('Gemini', 'OpenAI', 'Ollama')),
+    api_key TEXT NOT NULL DEFAULT '',
+    endpoint TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+    updated_at TEXT NOT NULL
+  );`);
+  target.run(`CREATE TABLE audio_tracks (
+    id INTEGER PRIMARY KEY,
+    content_project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+    voice_id TEXT NOT NULL CHECK (length(trim(voice_id)) > 0),
+    speed REAL NOT NULL CHECK (speed >= 0.75 AND speed <= 1.25),
+    script_snapshot TEXT NOT NULL CHECK (length(trim(script_snapshot)) > 0),
+    duration REAL NOT NULL CHECK (duration >= 0.0),
+    audio_blob BLOB NOT NULL,
+    created_at TEXT NOT NULL
+  );`);
   target.run("CREATE INDEX idx_content_projects_application_id ON content_projects(application_id)");
   target.run("CREATE INDEX idx_content_projects_company_id ON content_projects(company_id)");
+  target.run("CREATE INDEX idx_audio_tracks_content_project_id ON audio_tracks(content_project_id)");
   target.run("INSERT INTO workspace_meta (singleton, format_id, format_version) VALUES (1, ?, ?)", [FORMAT_ID, FORMAT_VERSION]);
   const stamp = now();
   for (const name of APPLICATION_SEEDS) target.run("INSERT INTO applications (name, created_at, updated_at) VALUES (?, ?, ?)", [name, stamp, stamp]);
@@ -161,6 +181,8 @@ function validateDatabase(candidate) {
     applications: ["id", "name", "created_at", "updated_at"], companies: ["id", "name", "created_at", "updated_at"],
     content_projects: ["id", "title", "description", "application_id", "company_id", "created_at", "updated_at"],
     drafts: ["id", "content_project_id", "draft_type", "body", "created_at", "updated_at"], workspace_meta: ["singleton", "format_id", "format_version"],
+    ai_settings: ["provider", "api_key", "endpoint", "is_active", "updated_at"],
+    audio_tracks: ["id", "content_project_id", "voice_id", "speed", "script_snapshot", "duration", "audio_blob", "created_at"],
   };
   for (const [table, columns] of Object.entries(expectedColumns)) {
     const actual = query(`PRAGMA table_info(${table})`).map((row) => row.name);
@@ -172,6 +194,8 @@ function validateDatabase(candidate) {
     companies: ["NAME TEXT NOT NULL UNIQUE", "CHECK (LENGTH(TRIM(NAME)) > 0)"],
     content_projects: ["TITLE TEXT NOT NULL", "ON DELETE SET NULL"],
     drafts: ["CONTENT_PROJECT_ID INTEGER NOT NULL UNIQUE", "ON DELETE CASCADE", "DRAFT_TYPE IN ('SCRIPT', 'PROMPT')", "LENGTH(TRIM(BODY)) > 0"],
+    ai_settings: ["PROVIDER IN ('GEMINI', 'OPENAI', 'OLLAMA')", "IS_ACTIVE IN (0, 1)"],
+    audio_tracks: ["CONTENT_PROJECT_ID INTEGER NOT NULL", "ON DELETE CASCADE", "SPEED >= 0.75", "SPEED <= 1.25", "DURATION >= 0.0"],
   };
   for (const [table, parts] of Object.entries(requiredDefinitionParts)) {
     if (parts.some((part) => !definitions[table]?.includes(part))) throw new WorkerError("invalid_import", "The selected workspace is missing required data constraints.");
@@ -284,6 +308,91 @@ function upsertDraft(payload) {
   return one("SELECT * FROM drafts WHERE content_project_id = ?", [projectId]);
 }
 
+function aiSettingsGet(includeKey = false) {
+  const records = rows("SELECT provider, api_key, endpoint, is_active, updated_at FROM ai_settings ORDER BY provider");
+  return records.map((row) => ({
+    provider: row.provider,
+    api_key: includeKey ? row.api_key : (row.api_key ? "••••••••" : ""),
+    endpoint: row.endpoint,
+    is_active: Boolean(row.is_active),
+    updated_at: row.updated_at,
+  }));
+}
+
+function aiSettingsSave(payload) {
+  const provider = payload?.provider;
+  if (!SUPPORTED_PROVIDERS.includes(provider)) {
+    throw new WorkerError("validation_error", `Provider must be one of: ${SUPPORTED_PROVIDERS.join(", ")}`);
+  }
+  const apiKey = typeof payload?.api_key === "string" ? payload.api_key.trim() : "";
+  const endpoint = typeof payload?.endpoint === "string" ? payload.endpoint.trim() : "";
+  const isActive = payload?.is_active === 1 || payload?.is_active === true ? 1 : 0;
+  const stamp = now();
+
+  if (isActive === 1) {
+    db.run("UPDATE ai_settings SET is_active = 0");
+  }
+
+  db.run(`INSERT INTO ai_settings (provider, api_key, endpoint, is_active, updated_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(provider) DO UPDATE SET api_key = excluded.api_key, endpoint = excluded.endpoint, is_active = excluded.is_active, updated_at = excluded.updated_at`,
+    [provider, apiKey, endpoint, isActive, stamp]
+  );
+  return aiSettingsGet(false);
+}
+
+function audioTracksSave(payload) {
+  const projectId = payload?.content_project_id;
+  project(projectId);
+  const voiceId = normalizeRequired(payload?.voice_id, "voice_id");
+  const speed = typeof payload?.speed === "number" ? payload.speed : parseFloat(payload?.speed);
+  if (isNaN(speed) || speed < 0.75 || speed > 1.25) {
+    throw new WorkerError("validation_error", "speed must be between 0.75 and 1.25");
+  }
+  const scriptSnapshot = normalizeRequired(payload?.script_snapshot, "script_snapshot");
+  const duration = typeof payload?.duration === "number" ? payload.duration : parseFloat(payload?.duration);
+  if (isNaN(duration) || duration < 0) {
+    throw new WorkerError("validation_error", "duration must be a non-negative number");
+  }
+  let audioBytes = payload?.audio_blob;
+  if (audioBytes instanceof ArrayBuffer) {
+    audioBytes = new Uint8Array(audioBytes);
+  } else if (!(audioBytes instanceof Uint8Array)) {
+    if (Array.isArray(audioBytes)) {
+      audioBytes = new Uint8Array(audioBytes);
+    } else {
+      throw new WorkerError("validation_error", "audio_blob must be binary data");
+    }
+  }
+  const stamp = now();
+  db.run(`INSERT INTO audio_tracks (content_project_id, voice_id, speed, script_snapshot, duration, audio_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [projectId, voiceId, speed, scriptSnapshot, duration, audioBytes, stamp]
+  );
+  const insertedId = one("SELECT last_insert_rowid() AS id").id;
+  return one("SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE id = ?", [insertedId]);
+}
+
+function audioTracksList(projectId) {
+  if (projectId) project(projectId);
+  const sql = projectId
+    ? "SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE content_project_id = ? ORDER BY created_at DESC"
+    : "SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks ORDER BY created_at DESC";
+  return rows(sql, projectId ? [projectId] : []);
+}
+
+function audioTracksGet(id) {
+  if (!Number.isInteger(id) || id < 1) throw new WorkerError("not_found", "Audio track was not found");
+  const record = one("SELECT * FROM audio_tracks WHERE id = ?", [id]);
+  if (!record) throw new WorkerError("not_found", `Audio track ${id} was not found`);
+  return record;
+}
+
+function audioTracksDelete(id) {
+  const record = one("SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE id = ?", [id]);
+  if (!record) throw new WorkerError("not_found", `Audio track ${id} was not found`);
+  db.run("DELETE FROM audio_tracks WHERE id = ?", [id]);
+  return record;
+}
+
 async function openWorkspace() {
   SQL ||= await initSqlJs({ locateFile: (file) => `vendor/sql.js/${file}` });
   if (db) return { format_id: FORMAT_ID, format_version: FORMAT_VERSION, restored: true };
@@ -302,7 +411,21 @@ async function openWorkspace() {
 async function dispatch(operation, payload) {
   if (operation === "workspace.open") return openWorkspace();
   if (!db) throw new WorkerError("validation_error", "Open the workspace before using it.");
-  if (operation === "workspace.export") return { filename: `video-content-factory-workspace-v${FORMAT_VERSION}.sqlite`, bytes: db.export() };
+  if (operation === "workspace.export") {
+    const activeBytes = db.export();
+    const tempDb = new SQL.Database(activeBytes);
+    tempDb.run("UPDATE ai_settings SET api_key = ''");
+    const sanitizedBytes = tempDb.export();
+    tempDb.close();
+    return { filename: `video-content-factory-workspace-v${FORMAT_VERSION}.sqlite`, bytes: sanitizedBytes };
+  }
+  if (operation === "ai_settings.get") return aiSettingsGet(payload?.include_key);
+  if (operation === "ai_settings.save") return persistMutation(transaction(() => aiSettingsSave(payload || {})));
+  if (operation === "audio_tracks.save") return persistMutation(transaction(() => audioTracksSave(payload || {})));
+  if (operation === "audio_tracks.list") return audioTracksList(payload?.content_project_id);
+  if (operation === "audio_tracks.get") return audioTracksGet(payload?.id);
+  if (operation === "audio_tracks.delete") return persistMutation(transaction(() => audioTracksDelete(payload?.id)));
+
   if (operation === "workspace.import.validate") {
     const bytes = payload?.bytes instanceof Uint8Array ? payload.bytes : new Uint8Array(payload?.bytes || []);
     if (!bytes.byteLength) throw new WorkerError("invalid_import", "Choose a non-empty SQLite workspace file.");
