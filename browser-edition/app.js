@@ -504,9 +504,9 @@
 
   async function loadProjectAudioTracks(projectId, autoActiveTrackId = null) {
     state.audioTracks = await rpc('audio_tracks.list', { content_project_id: Number(projectId) });
-    const activeId = autoActiveTrackId || state.audioTracks[0]?.id;
-    if (activeId) {
-      await loadActiveAudioTrack(activeId);
+    const targetTrackId = autoActiveTrackId || (state.activeAudioTrack && state.audioTracks.some(t => t.id === state.activeAudioTrack.id) ? state.activeAudioTrack.id : state.audioTracks[0]?.id);
+    if (targetTrackId) {
+      await loadActiveAudioTrack(targetTrackId);
     } else {
       if (currentAudioObjectUrl) URL.revokeObjectURL(currentAudioObjectUrl);
       currentAudioObjectUrl = null;
@@ -518,14 +518,20 @@
     const fullTrack = await rpc('audio_tracks.get', { id: Number(trackId) });
     state.activeAudioTrack = fullTrack;
 
-    if (currentAudioObjectUrl) URL.revokeObjectURL(currentAudioObjectUrl);
+    if (currentAudioObjectUrl) {
+      URL.revokeObjectURL(currentAudioObjectUrl);
+      currentAudioObjectUrl = null;
+    }
     
     let blobBytes = fullTrack.audio_blob;
-    if (Array.isArray(blobBytes)) blobBytes = new Uint8Array(blobBytes);
-    else if (blobBytes instanceof ArrayBuffer) blobBytes = new Uint8Array(blobBytes);
-
-    const blob = new Blob([blobBytes], { type: 'audio/wav' });
-    currentAudioObjectUrl = URL.createObjectURL(blob);
+    if (blobBytes instanceof Blob) {
+      currentAudioObjectUrl = URL.createObjectURL(blobBytes);
+    } else {
+      if (Array.isArray(blobBytes)) blobBytes = new Uint8Array(blobBytes);
+      else if (blobBytes instanceof ArrayBuffer) blobBytes = new Uint8Array(blobBytes);
+      const blob = new Blob([blobBytes], { type: 'audio/wav' });
+      currentAudioObjectUrl = URL.createObjectURL(blob);
+    }
   }
 
   // Render Dispatcher
@@ -554,8 +560,28 @@
     } catch (error) { app.innerHTML = `<div class="alert alert-danger">${escape(error.message)}</div>`; }
   }
 
-  function go(view, options = {}) { Object.assign(state, { view, selected: null, record: null, kind: null }, options); render(); }
-  async function refreshAfterWorkspaceReplacement(message) { state.pendingImport = null; fileInput.value = ''; showNotice(message); go('projects'); }
+  function go(view, options = {}) {
+    if (view !== 'project-detail' && currentAudioObjectUrl) {
+      URL.revokeObjectURL(currentAudioObjectUrl);
+      currentAudioObjectUrl = null;
+      state.activeAudioTrack = null;
+    }
+    Object.assign(state, { view, selected: null, record: null, kind: null }, options);
+    render();
+  }
+
+  async function refreshAfterWorkspaceReplacement(message) {
+    if (currentAudioObjectUrl) {
+      URL.revokeObjectURL(currentAudioObjectUrl);
+      currentAudioObjectUrl = null;
+    }
+    state.activeAudioTrack = null;
+    state.audioTracks = [];
+    state.pendingImport = null;
+    fileInput.value = '';
+    showNotice(message);
+    go('projects');
+  }
 
   // Global Event Listeners
   document.addEventListener('click', async event => {
@@ -579,7 +605,18 @@
       if (action === 'new-project') return go('project-form');
       if (action === 'open-project') return go('project-detail', { selected: id });
       if (action === 'edit-project') return go('project-form', { record: await rpc('projects.get', { id: Number(id) }) });
-      if (action === 'delete-project') { if (!confirm('Delete this content project and its draft?')) return; await rpc('projects.delete', { id: Number(id) }); showNotice('Content project deleted.'); return go('projects'); }
+      if (action === 'delete-project') {
+        if (!confirm('Delete this content project and its draft?')) return;
+        if (currentAudioObjectUrl) {
+          URL.revokeObjectURL(currentAudioObjectUrl);
+          currentAudioObjectUrl = null;
+        }
+        state.activeAudioTrack = null;
+        state.audioTracks = [];
+        await rpc('projects.delete', { id: Number(id) });
+        showNotice('Content project deleted.');
+        return go('projects');
+      }
       
       // Enhancement Actions
       if (action === 'toggle-key-visibility') {
@@ -600,6 +637,13 @@
       }
       if (action === 'delete-audio-track') {
         if (!confirm('Delete this synthesized audio track?')) return;
+        if (state.activeAudioTrack && state.activeAudioTrack.id === Number(id)) {
+          if (currentAudioObjectUrl) {
+            URL.revokeObjectURL(currentAudioObjectUrl);
+            currentAudioObjectUrl = null;
+          }
+          state.activeAudioTrack = null;
+        }
         await rpc('audio_tracks.delete', { id: Number(id) });
         showNotice('Audio track deleted.');
         await loadProjectAudioTracks(projectId);
@@ -608,7 +652,23 @@
       }
 
       // Workspace Actions
-      if (action === 'export-workspace') { const backup = await rpc('workspace.export'); const blob = new Blob([backup.bytes], { type: 'application/vnd.sqlite3' }); const link = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: backup.filename }); link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 0); showNotice('Workspace backup downloaded.'); return; }
+      if (action === 'export-workspace') {
+        const backup = await rpc('workspace.export');
+        let blobData = backup.bytes;
+        if (!blobData && backup.json) {
+          blobData = typeof backup.json === 'string' ? backup.json : JSON.stringify(backup.json, null, 2);
+        } else if (!blobData) {
+          blobData = JSON.stringify(backup, null, 2);
+        }
+        const blob = new Blob([blobData], { type: 'application/json' });
+        const filename = backup.filename || 'video-content-factory-workspace-v1.json';
+        const url = URL.createObjectURL(blob);
+        const link = Object.assign(document.createElement('a'), { href: url, download: filename });
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 100);
+        showNotice('Workspace backup downloaded.');
+        return;
+      }
       if (action === 'confirm-import') { if (!state.pendingImport || !confirm('Replace the current browser workspace with this validated backup?')) return; await rpc('workspace.import.commit', { token: state.pendingImport.token }); return refreshAfterWorkspaceReplacement('Workspace imported.'); }
       if (action === 'reset-workspace') { if (!confirm('Restore sample data? This permanently replaces the current browser workspace.')) return; await rpc('workspace.reset', { confirmed: true }); return refreshAfterWorkspaceReplacement('Sample data restored.'); }
     } catch (error) { showNotice(error.message, 'danger'); }
@@ -650,7 +710,8 @@
   fileInput.addEventListener('change', async () => {
     const file = fileInput.files?.[0]; if (!file) return;
     try {
-      const validated = await rpc('workspace.import.validate', { bytes: new Uint8Array(await file.arrayBuffer()) });
+      const arrayBuffer = await file.arrayBuffer();
+      const validated = await rpc('workspace.import.validate', { bytes: new Uint8Array(arrayBuffer) });
       state.pendingImport = validated;
       showImportReady(validated);
     } catch (error) { state.pendingImport = null; showNotice(error.message, 'danger'); }
@@ -658,12 +719,19 @@
 
   async function start() {
     try {
-      const opened = await rpc('workspace.open'); state.ready = true;
+      const opened = await rpc('workspace.open');
+      state.ready = true;
       workspaceStatus.textContent = opened.restored ? 'Browser workspace opened.' : 'New browser workspace created with sample data.';
-      await ttsRpc('init');
-      const initial = location.hash.slice(1); if (['projects', 'applications', 'companies', 'settings'].includes(initial)) state.view = initial;
+      const initial = location.hash.slice(1);
+      if (['projects', 'applications', 'companies', 'settings'].includes(initial)) state.view = initial;
       render();
-    } catch (error) { workspaceStatus.textContent = 'Browser workspace unavailable.'; app.innerHTML = `<div class="alert alert-danger">${escape(error.message)}</div>`; }
+      ttsRpc('init').catch(err => {
+        console.warn('TTS init background notice:', err);
+      });
+    } catch (error) {
+      workspaceStatus.textContent = 'Browser workspace unavailable.';
+      app.innerHTML = `<div class="alert alert-danger">${escape(error.message)}</div>`;
+    }
   }
 
   start();

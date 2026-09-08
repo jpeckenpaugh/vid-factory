@@ -1,20 +1,16 @@
-/* Browser-local SQLite workspace owner. This Worker is the only code that
- * loads sql.js, opens OPFS, or constructs SQL for the browser runtime. */
-importScripts("vendor/sql.js/sql-wasm.js");
+/* Browser-local IndexedDB workspace owner. This Worker manages the native
+ * IndexedDB database 'video-content-factory-workspace' for the browser runtime. */
 
-const WORKSPACE_FILE = "video-content-factory-workspace.sqlite";
+const DB_NAME = "video-content-factory-workspace";
+const DB_VERSION = 1;
 const FORMAT_ID = "video-content-factory-workspace";
 const FORMAT_VERSION = 1;
 const APPLICATION_SEEDS = ["YouTube", "TikTok", "Instagram"];
 const COMPANY_SEEDS = ["Acme Studio", "Northstar Media", "Pine & Peak"];
-const REQUIRED_TABLES = ["applications", "companies", "content_projects", "drafts", "workspace_meta", "ai_settings", "audio_tracks"];
-const REQUIRED_INDEXES = ["idx_content_projects_application_id", "idx_content_projects_company_id", "idx_audio_tracks_content_project_id"];
 const SUPPORTED_PROVIDERS = ["Gemini", "OpenAI", "Ollama"];
 
-
-let SQL;
-let db;
-let persistedBytes;
+let dbInstance = null;
+let isRestored = false;
 let pendingImport = null;
 let requestChain = Promise.resolve();
 
@@ -44,282 +40,406 @@ function normalizeOptional(value, field) {
   return value;
 }
 
-function rows(statement, params = []) {
-  const result = db.exec(statement, params);
-  if (!result.length) return [];
-  const { columns, values } = result[0];
-  return values.map((valueRow) => Object.fromEntries(columns.map((column, i) => [column, valueRow[i]])));
+/* ==========================================================================
+ * IndexedDB Promise Helpers
+ * ========================================================================== */
+
+function reqToPromise(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
 }
 
-function one(statement, params = []) {
-  return rows(statement, params)[0] || null;
+function txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("Transaction aborted"));
+  });
 }
 
-function requireRow(table, id, label = table.slice(0, -1)) {
+function openDatabase() {
+  return new Promise((resolve, reject) => {
+    let newlyCreated = false;
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = (event) => {
+      const db = request.result;
+      const tx = request.transaction;
+      newlyCreated = true;
+
+      // 1. applications
+      if (!db.objectStoreNames.contains("applications")) {
+        const appStore = db.createObjectStore("applications", { keyPath: "id", autoIncrement: true });
+        appStore.createIndex("name", "name", { unique: true });
+      }
+
+      // 2. companies
+      if (!db.objectStoreNames.contains("companies")) {
+        const compStore = db.createObjectStore("companies", { keyPath: "id", autoIncrement: true });
+        compStore.createIndex("name", "name", { unique: true });
+      }
+
+      // 3. content_projects
+      if (!db.objectStoreNames.contains("content_projects")) {
+        const projStore = db.createObjectStore("content_projects", { keyPath: "id", autoIncrement: true });
+        projStore.createIndex("updated_at", "updated_at", { unique: false });
+        projStore.createIndex("application_id", "application_id", { unique: false });
+        projStore.createIndex("company_id", "company_id", { unique: false });
+      }
+
+      // 4. drafts
+      if (!db.objectStoreNames.contains("drafts")) {
+        db.createObjectStore("drafts", { keyPath: "content_project_id" });
+      }
+
+      // 5. ai_settings
+      if (!db.objectStoreNames.contains("ai_settings")) {
+        db.createObjectStore("ai_settings", { keyPath: "provider" });
+      }
+
+      // 6. audio_tracks
+      if (!db.objectStoreNames.contains("audio_tracks")) {
+        const audioStore = db.createObjectStore("audio_tracks", { keyPath: "id", autoIncrement: true });
+        audioStore.createIndex("content_project_id", "content_project_id", { unique: false });
+      }
+
+      // 7. workspace_meta
+      if (!db.objectStoreNames.contains("workspace_meta")) {
+        db.createObjectStore("workspace_meta", { keyPath: "singleton" });
+      }
+
+      // Seed initial data
+      const stamp = now();
+      const metaStore = tx.objectStore("workspace_meta");
+      metaStore.add({ singleton: 1, format_id: FORMAT_ID, format_version: FORMAT_VERSION });
+
+      const appStore = tx.objectStore("applications");
+      for (const name of APPLICATION_SEEDS) {
+        appStore.add({ name, created_at: stamp, updated_at: stamp });
+      }
+
+      const compStore = tx.objectStore("companies");
+      for (const name of COMPANY_SEEDS) {
+        compStore.add({ name, created_at: stamp, updated_at: stamp });
+      }
+
+      const aiStore = tx.objectStore("ai_settings");
+      for (const provider of SUPPORTED_PROVIDERS) {
+        aiStore.add({ provider, api_key: "", endpoint: "", is_active: 0, updated_at: stamp });
+      }
+    };
+
+    request.onsuccess = () => {
+      dbInstance = request.result;
+      isRestored = !newlyCreated;
+      resolve(dbInstance);
+    };
+
+    request.onerror = () => {
+      reject(new WorkerError("persistence_error", "The browser workspace database could not be opened."));
+    };
+  });
+}
+
+function getStore(storeName, mode = "readonly") {
+  if (!dbInstance) {
+    throw new WorkerError("validation_error", "Open the workspace before using it.");
+  }
+  const tx = dbInstance.transaction(storeName, mode);
+  const store = tx.objectStore(Array.isArray(storeName) ? storeName[0] : storeName);
+  return { store, tx };
+}
+
+function getStores(storeNames, mode = "readonly") {
+  if (!dbInstance) {
+    throw new WorkerError("validation_error", "Open the workspace before using it.");
+  }
+  const tx = dbInstance.transaction(storeNames, mode);
+  const stores = {};
+  for (const name of storeNames) {
+    stores[name] = tx.objectStore(name);
+  }
+  return { stores, tx };
+}
+
+/* ==========================================================================
+ * Catalog Operations (Applications & Companies)
+ * ========================================================================== */
+
+async function requireCatalogRow(table, id, label = table.slice(0, -1)) {
   if (!Number.isInteger(id) || id < 1) throw new WorkerError("not_found", `${label} was not found`);
-  const record = one(`SELECT * FROM ${table} WHERE id = ?`, [id]);
+  const { store } = getStore(table, "readonly");
+  const record = await reqToPromise(store.get(id));
   if (!record) throw new WorkerError("not_found", `${label} ${id} was not found`);
   return record;
 }
 
-function transaction(action) {
-  db.run("BEGIN");
-  try {
-    const result = action();
-    db.run("COMMIT");
-    return result;
-  } catch (error) {
-    try { db.run("ROLLBACK"); } catch (_) { /* transaction was not opened */ }
-    throw error;
-  }
+async function catalogList(table) {
+  const { store } = getStore(table, "readonly");
+  const records = await reqToPromise(store.getAll());
+  return records.sort((a, b) => a.name.localeCompare(b.name) || a.id - b.id);
 }
 
-function createSchema(target) {
-  target.run("PRAGMA foreign_keys = ON");
-  target.run(`CREATE TABLE applications (
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE CHECK (length(trim(name)) > 0),
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  );`);
-  target.run(`CREATE TABLE companies (
-    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE CHECK (length(trim(name)) > 0),
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  );`);
-  target.run(`CREATE TABLE content_projects (
-    id INTEGER PRIMARY KEY, title TEXT NOT NULL CHECK (length(trim(title)) > 0),
-    description TEXT NOT NULL DEFAULT '',
-    application_id INTEGER REFERENCES applications(id) ON DELETE SET NULL,
-    company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  );`);
-  target.run(`CREATE TABLE drafts (
-    id INTEGER PRIMARY KEY, content_project_id INTEGER NOT NULL UNIQUE
-      REFERENCES content_projects(id) ON DELETE CASCADE,
-    draft_type TEXT NOT NULL CHECK (draft_type IN ('script', 'prompt')),
-    body TEXT NOT NULL CHECK (length(trim(body)) > 0),
-    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-  );`);
-  target.run(`CREATE TABLE workspace_meta (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    format_id TEXT NOT NULL CHECK (format_id = '${FORMAT_ID}'),
-    format_version INTEGER NOT NULL CHECK (format_version = ${FORMAT_VERSION})
-  );`);
-  target.run(`CREATE TABLE ai_settings (
-    provider TEXT PRIMARY KEY CHECK (provider IN ('Gemini', 'OpenAI', 'Ollama')),
-    api_key TEXT NOT NULL DEFAULT '',
-    endpoint TEXT NOT NULL DEFAULT '',
-    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
-    updated_at TEXT NOT NULL
-  );`);
-  target.run(`CREATE TABLE audio_tracks (
-    id INTEGER PRIMARY KEY,
-    content_project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
-    voice_id TEXT NOT NULL CHECK (length(trim(voice_id)) > 0),
-    speed REAL NOT NULL CHECK (speed >= 0.75 AND speed <= 1.25),
-    script_snapshot TEXT NOT NULL CHECK (length(trim(script_snapshot)) > 0),
-    duration REAL NOT NULL CHECK (duration >= 0.0),
-    audio_blob BLOB NOT NULL,
-    created_at TEXT NOT NULL
-  );`);
-  target.run("CREATE INDEX idx_content_projects_application_id ON content_projects(application_id)");
-  target.run("CREATE INDEX idx_content_projects_company_id ON content_projects(company_id)");
-  target.run("CREATE INDEX idx_audio_tracks_content_project_id ON audio_tracks(content_project_id)");
-  target.run("INSERT INTO workspace_meta (singleton, format_id, format_version) VALUES (1, ?, ?)", [FORMAT_ID, FORMAT_VERSION]);
-  const stamp = now();
-  for (const name of APPLICATION_SEEDS) target.run("INSERT INTO applications (name, created_at, updated_at) VALUES (?, ?, ?)", [name, stamp, stamp]);
-  for (const name of COMPANY_SEEDS) target.run("INSERT INTO companies (name, created_at, updated_at) VALUES (?, ?, ?)", [name, stamp, stamp]);
-}
-
-function freshDatabase() {
-  const target = new SQL.Database();
-  createSchema(target);
-  return target;
-}
-
-async function workspaceHandle() {
-  const root = await self.navigator.storage.getDirectory();
-  return root.getFileHandle(WORKSPACE_FILE, { create: true });
-}
-
-async function writeWorkspace(bytes) {
-  const handle = await workspaceHandle();
-  const writable = await handle.createWritable();
-  try {
-    await writable.write(bytes);
-    await writable.close();
-  } catch (error) {
-    try { await writable.abort(); } catch (_) { /* best effort */ }
-    throw error;
-  }
-}
-
-async function loadPersistedBytes() {
-  const root = await self.navigator.storage.getDirectory();
-  try {
-    const handle = await root.getFileHandle(WORKSPACE_FILE);
-    return new Uint8Array(await (await handle.getFile()).arrayBuffer());
-  } catch (error) {
-    if (error && error.name === "NotFoundError") return null;
-    throw error;
-  }
-}
-
-function validateDatabase(candidate) {
-  const query = (sql, params = []) => {
-    const result = candidate.exec(sql, params);
-    if (!result.length) return [];
-    const { columns, values } = result[0];
-    return values.map((row) => Object.fromEntries(columns.map((column, i) => [column, row[i]])));
-  };
-  const integrity = query("PRAGMA integrity_check");
-  if (integrity.length !== 1 || integrity[0].integrity_check !== "ok") throw new WorkerError("invalid_import", "The selected workspace failed its integrity check.");
-  if (query("PRAGMA foreign_key_check").length) throw new WorkerError("invalid_import", "The selected workspace has invalid record relationships.");
-  const names = new Set(query("SELECT name FROM sqlite_master WHERE type = 'table'").map((row) => row.name));
-  if (REQUIRED_TABLES.some((name) => !names.has(name))) throw new WorkerError("invalid_import", "The selected file is not a complete Video Content Factory workspace.");
-  const indexes = new Set(query("SELECT name FROM sqlite_master WHERE type = 'index'").map((row) => row.name));
-  if (REQUIRED_INDEXES.some((name) => !indexes.has(name))) throw new WorkerError("invalid_import", "The selected workspace has an incompatible schema.");
-  const expectedColumns = {
-    applications: ["id", "name", "created_at", "updated_at"], companies: ["id", "name", "created_at", "updated_at"],
-    content_projects: ["id", "title", "description", "application_id", "company_id", "created_at", "updated_at"],
-    drafts: ["id", "content_project_id", "draft_type", "body", "created_at", "updated_at"], workspace_meta: ["singleton", "format_id", "format_version"],
-    ai_settings: ["provider", "api_key", "endpoint", "is_active", "updated_at"],
-    audio_tracks: ["id", "content_project_id", "voice_id", "speed", "script_snapshot", "duration", "audio_blob", "created_at"],
-  };
-  for (const [table, columns] of Object.entries(expectedColumns)) {
-    const actual = query(`PRAGMA table_info(${table})`).map((row) => row.name);
-    if (columns.some((column) => !actual.includes(column))) throw new WorkerError("invalid_import", "The selected workspace has incompatible table columns.");
-  }
-  const definitions = Object.fromEntries(query("SELECT name, sql FROM sqlite_master WHERE type = 'table'").map((row) => [row.name, (row.sql || "").replace(/\s+/g, " ").toUpperCase()]));
-  const requiredDefinitionParts = {
-    applications: ["NAME TEXT NOT NULL UNIQUE", "CHECK (LENGTH(TRIM(NAME)) > 0)"],
-    companies: ["NAME TEXT NOT NULL UNIQUE", "CHECK (LENGTH(TRIM(NAME)) > 0)"],
-    content_projects: ["TITLE TEXT NOT NULL", "ON DELETE SET NULL"],
-    drafts: ["CONTENT_PROJECT_ID INTEGER NOT NULL UNIQUE", "ON DELETE CASCADE", "DRAFT_TYPE IN ('SCRIPT', 'PROMPT')", "LENGTH(TRIM(BODY)) > 0"],
-    ai_settings: ["PROVIDER IN ('GEMINI', 'OPENAI', 'OLLAMA')", "IS_ACTIVE IN (0, 1)"],
-    audio_tracks: ["CONTENT_PROJECT_ID INTEGER NOT NULL", "ON DELETE CASCADE", "SPEED >= 0.75", "SPEED <= 1.25", "DURATION >= 0.0"],
-  };
-  for (const [table, parts] of Object.entries(requiredDefinitionParts)) {
-    if (parts.some((part) => !definitions[table]?.includes(part))) throw new WorkerError("invalid_import", "The selected workspace is missing required data constraints.");
-  }
-  const meta = query("SELECT singleton, format_id, format_version FROM workspace_meta");
-  if (meta.length !== 1 || meta[0].singleton !== 1 || meta[0].format_id !== FORMAT_ID || meta[0].format_version !== FORMAT_VERSION) {
-    throw new WorkerError("invalid_import", "The selected workspace format is not supported.");
-  }
-  if (query("SELECT id FROM drafts WHERE draft_type NOT IN ('script', 'prompt') OR length(trim(body)) = 0").length) {
-    throw new WorkerError("invalid_import", "The selected workspace contains invalid drafts.");
-  }
-}
-
-async function restoreLastPersisted() {
-  if (!persistedBytes) return;
-  db?.close();
-  db = new SQL.Database(persistedBytes);
-  db.run("PRAGMA foreign_keys = ON");
-}
-
-async function persistMutation(result) {
-  const bytes = db.export();
-  try {
-    await writeWorkspace(bytes);
-    persistedBytes = bytes;
-    return result;
-  } catch (error) {
-    await restoreLastPersisted();
-    throw new WorkerError("persistence_error", "Your change could not be saved to the browser workspace.");
-  }
-}
-
-function catalogOperation(table, verb, payload) {
+async function catalogGet(table, payload) {
   const id = payload?.id;
-  if (verb === "list") return rows(`SELECT * FROM ${table} ORDER BY name, id`);
-  if (verb === "get") return requireRow(table, id);
-  if (verb === "delete") {
-    const record = requireRow(table, id);
-    db.run(`DELETE FROM ${table} WHERE id = ?`, [id]);
-    return record;
-  }
+  return requireCatalogRow(table, id);
+}
+
+async function catalogCreate(table, payload) {
   const name = normalizeRequired(payload?.name, "name");
-  if (verb === "create") {
-    const stamp = now();
-    try { db.run(`INSERT INTO ${table} (name, created_at, updated_at) VALUES (?, ?, ?)`, [name, stamp, stamp]); }
-    catch (error) { if (/UNIQUE/.test(error.message)) throw new WorkerError("conflict", `An ${table.slice(0, -1)} with that name already exists.`); throw error; }
-    return one(`SELECT * FROM ${table} WHERE id = last_insert_rowid()`);
+  const stamp = now();
+  const { store, tx } = getStore(table, "readwrite");
+
+  // Check unique index
+  const nameIndex = store.index("name");
+  const existing = await reqToPromise(nameIndex.get(name));
+  if (existing) {
+    throw new WorkerError("conflict", `An ${table.slice(0, -1)} with that name already exists.`);
   }
-  requireRow(table, id);
-  if (verb === "update") {
-    try { db.run(`UPDATE ${table} SET name = ?, updated_at = ? WHERE id = ?`, [name, now(), id]); }
-    catch (error) { if (/UNIQUE/.test(error.message)) throw new WorkerError("conflict", `An ${table.slice(0, -1)} with that name already exists.`); throw error; }
-    return requireRow(table, id);
-  }
-  throw new WorkerError("validation_error", "Unknown catalog operation.");
+
+  const id = await reqToPromise(store.add({ name, created_at: stamp, updated_at: stamp }));
+  await txDone(tx);
+  return { id, name, created_at: stamp, updated_at: stamp };
 }
 
-function validateAssociations(applicationId, companyId) {
-  if (applicationId !== null && !one("SELECT id FROM applications WHERE id = ?", [applicationId])) throw new WorkerError("validation_error", `Application ${applicationId} was not found.`);
-  if (companyId !== null && !one("SELECT id FROM companies WHERE id = ?", [companyId])) throw new WorkerError("validation_error", `Company ${companyId} was not found.`);
+async function catalogUpdate(table, payload) {
+  const id = payload?.id;
+  const existing = await requireCatalogRow(table, id);
+  const name = normalizeRequired(payload?.name, "name");
+  const stamp = now();
+
+  const { store, tx } = getStore(table, "readwrite");
+  const nameIndex = store.index("name");
+  const duplicate = await reqToPromise(nameIndex.get(name));
+  if (duplicate && duplicate.id !== id) {
+    throw new WorkerError("conflict", `An ${table.slice(0, -1)} with that name already exists.`);
+  }
+
+  const updatedRecord = { ...existing, name, updated_at: stamp };
+  await reqToPromise(store.put(updatedRecord));
+  await txDone(tx);
+  return updatedRecord;
 }
 
-const PROJECT_SELECT = `SELECT p.*, a.name AS application_name, c.name AS company_name FROM content_projects p
-  LEFT JOIN applications a ON a.id = p.application_id LEFT JOIN companies c ON c.id = p.company_id`;
-function project(id) {
-  const record = one(`${PROJECT_SELECT} WHERE p.id = ?`, [id]);
+async function catalogDelete(table, payload) {
+  const id = payload?.id;
+  const record = await requireCatalogRow(table, id);
+
+  const { stores, tx } = getStores([table, "content_projects"], "readwrite");
+  await reqToPromise(stores[table].delete(id));
+
+  // Nullify references in content_projects
+  const foreignKey = table === "applications" ? "application_id" : "company_id";
+  const projIndex = stores.content_projects.index(foreignKey);
+  const affectedProjects = await reqToPromise(projIndex.getAll(id));
+  for (const proj of affectedProjects) {
+    proj[foreignKey] = null;
+    await reqToPromise(stores.content_projects.put(proj));
+  }
+
+  await txDone(tx);
+  return record;
+}
+
+/* ==========================================================================
+ * Project Operations
+ * ========================================================================== */
+
+async function requireProject(id) {
+  if (!Number.isInteger(id) || id < 1) throw new WorkerError("not_found", `Project ${id} was not found.`);
+  const { store } = getStore("content_projects", "readonly");
+  const record = await reqToPromise(store.get(id));
   if (!record) throw new WorkerError("not_found", `Project ${id} was not found.`);
   return record;
 }
-function projectDetail(id) {
-  const record = project(id);
-  record.draft = one("SELECT * FROM drafts WHERE content_project_id = ?", [id]);
-  return record;
+
+async function projectList() {
+  const { stores } = getStores(["content_projects", "applications", "companies"], "readonly");
+  const [projects, applications, companies] = await Promise.all([
+    reqToPromise(stores.content_projects.getAll()),
+    reqToPromise(stores.applications.getAll()),
+    reqToPromise(stores.companies.getAll()),
+  ]);
+
+  const appMap = new Map(applications.map((a) => [a.id, a]));
+  const compMap = new Map(companies.map((c) => [c.id, c]));
+
+  const enriched = projects.map((p) => ({
+    ...p,
+    application_name: p.application_id ? (appMap.get(p.application_id)?.name || null) : null,
+    company_name: p.company_id ? (compMap.get(p.company_id)?.name || null) : null,
+  }));
+
+  return enriched.sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id - a.id);
 }
-function projectPayload(payload) {
+
+async function projectDetail(id) {
+  const { stores } = getStores(["content_projects", "applications", "companies", "drafts"], "readonly");
+  const proj = await reqToPromise(stores.content_projects.get(id));
+  if (!proj) throw new WorkerError("not_found", `Project ${id} was not found.`);
+
+  const [app, comp, draft] = await Promise.all([
+    proj.application_id ? reqToPromise(stores.applications.get(proj.application_id)) : null,
+    proj.company_id ? reqToPromise(stores.companies.get(proj.company_id)) : null,
+    reqToPromise(stores.drafts.get(id)),
+  ]);
+
   return {
-    title: normalizeRequired(payload?.title, "title"), description: typeof payload?.description === "string" ? payload.description.trim() : "",
-    application_id: normalizeOptional(payload?.application_id, "application_id"), company_id: normalizeOptional(payload?.company_id, "company_id"),
+    ...proj,
+    application_name: app ? app.name : null,
+    company_name: comp ? comp.name : null,
+    draft: draft || null,
   };
 }
-function projectOperation(verb, payload) {
-  const id = payload?.id;
-  if (verb === "list") return rows(`${PROJECT_SELECT} ORDER BY p.updated_at DESC, p.id DESC`);
-  if (verb === "get") return projectDetail(id);
-  if (verb === "delete") { const record = project(id); db.run("DELETE FROM content_projects WHERE id = ?", [id]); return record; }
-  const input = projectPayload(payload);
-  validateAssociations(input.application_id, input.company_id);
-  if (verb === "create") {
-    const stamp = now();
-    db.run("INSERT INTO content_projects (title, description, application_id, company_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [input.title, input.description, input.application_id, input.company_id, stamp, stamp]);
-    return projectDetail(one("SELECT last_insert_rowid() AS id").id);
-  }
-  project(id);
-  if (verb === "update") {
-    db.run("UPDATE content_projects SET title = ?, description = ?, application_id = ?, company_id = ?, updated_at = ? WHERE id = ?", [input.title, input.description, input.application_id, input.company_id, now(), id]);
-    return projectDetail(id);
-  }
-  throw new WorkerError("validation_error", "Unknown project operation.");
+
+function projectPayload(payload) {
+  return {
+    title: normalizeRequired(payload?.title, "title"),
+    description: typeof payload?.description === "string" ? payload.description.trim() : "",
+    application_id: normalizeOptional(payload?.application_id, "application_id"),
+    company_id: normalizeOptional(payload?.company_id, "company_id"),
+  };
 }
 
-function upsertDraft(payload) {
+async function validateAssociations(applicationId, companyId, appStore, compStore) {
+  if (applicationId !== null) {
+    const app = await reqToPromise(appStore.get(applicationId));
+    if (!app) throw new WorkerError("validation_error", `Application ${applicationId} was not found.`);
+  }
+  if (companyId !== null) {
+    const comp = await reqToPromise(compStore.get(companyId));
+    if (!comp) throw new WorkerError("validation_error", `Company ${companyId} was not found.`);
+  }
+}
+
+async function projectCreate(payload) {
+  const input = projectPayload(payload);
+  const stamp = now();
+
+  const { stores, tx } = getStores(["content_projects", "applications", "companies"], "readwrite");
+  await validateAssociations(input.application_id, input.company_id, stores.applications, stores.companies);
+
+  const newProj = {
+    title: input.title,
+    description: input.description,
+    application_id: input.application_id,
+    company_id: input.company_id,
+    created_at: stamp,
+    updated_at: stamp,
+  };
+
+  const id = await reqToPromise(stores.content_projects.add(newProj));
+  await txDone(tx);
+  return projectDetail(id);
+}
+
+async function projectUpdate(payload) {
+  const id = payload?.id;
+  const existing = await requireProject(id);
+  const input = projectPayload(payload);
+
+  const { stores, tx } = getStores(["content_projects", "applications", "companies"], "readwrite");
+  await validateAssociations(input.application_id, input.company_id, stores.applications, stores.companies);
+
+  const updatedProj = {
+    ...existing,
+    title: input.title,
+    description: input.description,
+    application_id: input.application_id,
+    company_id: input.company_id,
+    updated_at: now(),
+  };
+
+  await reqToPromise(stores.content_projects.put(updatedProj));
+  await txDone(tx);
+  return projectDetail(id);
+}
+
+async function projectDelete(payload) {
+  const id = payload?.id;
+  const { stores, tx } = getStores(["content_projects", "applications", "companies", "drafts", "audio_tracks"], "readwrite");
+
+  const proj = await reqToPromise(stores.content_projects.get(id));
+  if (!proj) throw new WorkerError("not_found", `Project ${id} was not found.`);
+
+  const [app, comp] = await Promise.all([
+    proj.application_id ? reqToPromise(stores.applications.get(proj.application_id)) : null,
+    proj.company_id ? reqToPromise(stores.companies.get(proj.company_id)) : null,
+  ]);
+
+  // Delete project
+  await reqToPromise(stores.content_projects.delete(id));
+
+  // Cascading delete: drafts
+  await reqToPromise(stores.drafts.delete(id));
+
+  // Cascading delete: audio_tracks
+  const audioIndex = stores.audio_tracks.index("content_project_id");
+  const tracks = await reqToPromise(audioIndex.getAll(id));
+  for (const track of tracks) {
+    await reqToPromise(stores.audio_tracks.delete(track.id));
+  }
+
+  await txDone(tx);
+
+  return {
+    ...proj,
+    application_name: app ? app.name : null,
+    company_name: comp ? comp.name : null,
+  };
+}
+
+/* ==========================================================================
+ * Draft Operations
+ * ========================================================================== */
+
+async function upsertDraft(payload) {
   const projectId = payload?.project_id;
-  project(projectId);
+  await requireProject(projectId);
+
   const draftType = payload?.draft_type;
-  if (draftType !== "script" && draftType !== "prompt") throw new WorkerError("validation_error", "draft_type must be script or prompt");
+  if (draftType !== "script" && draftType !== "prompt") {
+    throw new WorkerError("validation_error", "draft_type must be script or prompt");
+  }
   const body = normalizeRequired(payload?.body, "body");
   const stamp = now();
-  db.run(`INSERT INTO drafts (content_project_id, draft_type, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(content_project_id) DO UPDATE SET draft_type = excluded.draft_type, body = excluded.body, updated_at = excluded.updated_at`, [projectId, draftType, body, stamp, stamp]);
-  return one("SELECT * FROM drafts WHERE content_project_id = ?", [projectId]);
+
+  const { store, tx } = getStore("drafts", "readwrite");
+  const existing = await reqToPromise(store.get(projectId));
+
+  const draftRecord = {
+    content_project_id: projectId,
+    draft_type: draftType,
+    body: body,
+    created_at: existing ? existing.created_at : stamp,
+    updated_at: stamp,
+  };
+
+  await reqToPromise(store.put(draftRecord));
+  await txDone(tx);
+  return draftRecord;
 }
 
-function aiSettingsGet(includeKey = false) {
-  const records = rows("SELECT provider, api_key, endpoint, is_active, updated_at FROM ai_settings ORDER BY provider");
-  return records.map((row) => ({
+/* ==========================================================================
+ * AI Settings Operations
+ * ========================================================================== */
+
+async function aiSettingsGet(includeKey = false) {
+  const { store } = getStore("ai_settings", "readonly");
+  const records = await reqToPromise(store.getAll());
+  const sorted = records.sort((a, b) => a.provider.localeCompare(b.provider));
+  return sorted.map((row) => ({
     provider: row.provider,
     api_key: includeKey ? row.api_key : (row.api_key ? "••••••••" : ""),
-    endpoint: row.endpoint,
+    endpoint: row.endpoint || "",
     is_active: Boolean(row.is_active),
     updated_at: row.updated_at,
   }));
 }
 
-function aiSettingsSave(payload) {
+async function aiSettingsSave(payload) {
   const provider = payload?.provider;
   if (!SUPPORTED_PROVIDERS.includes(provider)) {
     throw new WorkerError("validation_error", `Provider must be one of: ${SUPPORTED_PROVIDERS.join(", ")}`);
@@ -329,20 +449,39 @@ function aiSettingsSave(payload) {
   const isActive = payload?.is_active === 1 || payload?.is_active === true ? 1 : 0;
   const stamp = now();
 
+  const { store, tx } = getStore("ai_settings", "readwrite");
+  const allSettings = await reqToPromise(store.getAll());
+
   if (isActive === 1) {
-    db.run("UPDATE ai_settings SET is_active = 0");
+    for (const setting of allSettings) {
+      if (setting.is_active) {
+        setting.is_active = 0;
+        await reqToPromise(store.put(setting));
+      }
+    }
   }
 
-  db.run(`INSERT INTO ai_settings (provider, api_key, endpoint, is_active, updated_at) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(provider) DO UPDATE SET api_key = excluded.api_key, endpoint = excluded.endpoint, is_active = excluded.is_active, updated_at = excluded.updated_at`,
-    [provider, apiKey, endpoint, isActive, stamp]
-  );
+  const updated = {
+    provider,
+    api_key: apiKey,
+    endpoint,
+    is_active: isActive,
+    updated_at: stamp,
+  };
+
+  await reqToPromise(store.put(updated));
+  await txDone(tx);
   return aiSettingsGet(false);
 }
 
-function audioTracksSave(payload) {
+/* ==========================================================================
+ * Audio Tracks Operations
+ * ========================================================================== */
+
+async function audioTracksSave(payload) {
   const projectId = payload?.content_project_id;
-  project(projectId);
+  await requireProject(projectId);
+
   const voiceId = normalizeRequired(payload?.voice_id, "voice_id");
   const speed = typeof payload?.speed === "number" ? payload.speed : parseFloat(payload?.speed);
   if (isNaN(speed) || speed < 0.75 || speed > 1.25) {
@@ -353,124 +492,312 @@ function audioTracksSave(payload) {
   if (isNaN(duration) || duration < 0) {
     throw new WorkerError("validation_error", "duration must be a non-negative number");
   }
+
   let audioBytes = payload?.audio_blob;
   if (audioBytes instanceof ArrayBuffer) {
     audioBytes = new Uint8Array(audioBytes);
-  } else if (!(audioBytes instanceof Uint8Array)) {
+  } else if (!(audioBytes instanceof Uint8Array) && !(audioBytes instanceof Blob)) {
     if (Array.isArray(audioBytes)) {
       audioBytes = new Uint8Array(audioBytes);
     } else {
       throw new WorkerError("validation_error", "audio_blob must be binary data");
     }
   }
+
   const stamp = now();
-  db.run(`INSERT INTO audio_tracks (content_project_id, voice_id, speed, script_snapshot, duration, audio_blob, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [projectId, voiceId, speed, scriptSnapshot, duration, audioBytes, stamp]
-  );
-  const insertedId = one("SELECT last_insert_rowid() AS id").id;
-  return one("SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE id = ?", [insertedId]);
+  const { store, tx } = getStore("audio_tracks", "readwrite");
+
+  const trackRecord = {
+    content_project_id: projectId,
+    voice_id: voiceId,
+    speed,
+    script_snapshot: scriptSnapshot,
+    duration,
+    audio_blob: audioBytes,
+    created_at: stamp,
+  };
+
+  const id = await reqToPromise(store.add(trackRecord));
+  await txDone(tx);
+
+  return {
+    id,
+    content_project_id: projectId,
+    voice_id: voiceId,
+    speed,
+    script_snapshot: scriptSnapshot,
+    duration,
+    created_at: stamp,
+  };
 }
 
-function audioTracksList(projectId) {
-  if (projectId) project(projectId);
-  const sql = projectId
-    ? "SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE content_project_id = ? ORDER BY created_at DESC"
-    : "SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks ORDER BY created_at DESC";
-  return rows(sql, projectId ? [projectId] : []);
+async function audioTracksList(projectId) {
+  if (projectId) await requireProject(projectId);
+
+  const { store } = getStore("audio_tracks", "readonly");
+  let records;
+  if (projectId) {
+    const index = store.index("content_project_id");
+    records = await reqToPromise(index.getAll(projectId));
+  } else {
+    records = await reqToPromise(store.getAll());
+  }
+
+  const summaries = records.map((t) => ({
+    id: t.id,
+    content_project_id: t.content_project_id,
+    voice_id: t.voice_id,
+    speed: t.speed,
+    script_snapshot: t.script_snapshot,
+    duration: t.duration,
+    created_at: t.created_at,
+  }));
+
+  return summaries.sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id - a.id);
 }
 
-function audioTracksGet(id) {
+async function audioTracksGet(id) {
   if (!Number.isInteger(id) || id < 1) throw new WorkerError("not_found", "Audio track was not found");
-  const record = one("SELECT * FROM audio_tracks WHERE id = ?", [id]);
+  const { store } = getStore("audio_tracks", "readonly");
+  const record = await reqToPromise(store.get(id));
   if (!record) throw new WorkerError("not_found", `Audio track ${id} was not found`);
   return record;
 }
 
-function audioTracksDelete(id) {
-  const record = one("SELECT id, content_project_id, voice_id, speed, script_snapshot, duration, created_at FROM audio_tracks WHERE id = ?", [id]);
+async function audioTracksDelete(id) {
+  if (!Number.isInteger(id) || id < 1) throw new WorkerError("not_found", "Audio track was not found");
+  const { store, tx } = getStore("audio_tracks", "readwrite");
+  const record = await reqToPromise(store.get(id));
   if (!record) throw new WorkerError("not_found", `Audio track ${id} was not found`);
-  db.run("DELETE FROM audio_tracks WHERE id = ?", [id]);
-  return record;
+
+  await reqToPromise(store.delete(id));
+  await txDone(tx);
+
+  return {
+    id: record.id,
+    content_project_id: record.content_project_id,
+    voice_id: record.voice_id,
+    speed: record.speed,
+    script_snapshot: record.script_snapshot,
+    duration: record.duration,
+    created_at: record.created_at,
+  };
 }
+
+/* ==========================================================================
+ * Workspace Export / Import / Reset Operations
+ * ========================================================================== */
+
+async function workspaceReset(payload) {
+  if (payload?.confirmed !== true) {
+    throw new WorkerError("validation_error", "Confirm sample-data restoration before replacing the workspace.");
+  }
+
+  const storeNames = ["applications", "companies", "content_projects", "drafts", "ai_settings", "audio_tracks", "workspace_meta"];
+  const { stores, tx } = getStores(storeNames, "readwrite");
+
+  for (const name of storeNames) {
+    await reqToPromise(stores[name].clear());
+  }
+
+  const stamp = now();
+  await reqToPromise(stores.workspace_meta.add({ singleton: 1, format_id: FORMAT_ID, format_version: FORMAT_VERSION }));
+
+  for (const name of APPLICATION_SEEDS) {
+    await reqToPromise(stores.applications.add({ name, created_at: stamp, updated_at: stamp }));
+  }
+
+  for (const name of COMPANY_SEEDS) {
+    await reqToPromise(stores.companies.add({ name, created_at: stamp, updated_at: stamp }));
+  }
+
+  for (const provider of SUPPORTED_PROVIDERS) {
+    await reqToPromise(stores.ai_settings.add({ provider, api_key: "", endpoint: "", is_active: 0, updated_at: stamp }));
+  }
+
+  await txDone(tx);
+  pendingImport = null;
+  return { reset: true };
+}
+
+async function workspaceExport() {
+  const storeNames = ["applications", "companies", "content_projects", "drafts", "ai_settings", "audio_tracks", "workspace_meta"];
+  const { stores } = getStores(storeNames, "readonly");
+
+  const [applications, companies, content_projects, drafts, ai_settings, audio_tracks, workspace_meta] = await Promise.all(
+    storeNames.map((name) => reqToPromise(stores[name].getAll()))
+  );
+
+  const sanitizedAiSettings = ai_settings.map((s) => ({ ...s, api_key: "" }));
+
+  const exportData = {
+    format_id: FORMAT_ID,
+    format_version: FORMAT_VERSION,
+    workspace_meta,
+    applications,
+    companies,
+    content_projects,
+    drafts,
+    ai_settings: sanitizedAiSettings,
+    audio_tracks: audio_tracks.map((t) => ({
+      ...t,
+      audio_blob: t.audio_blob instanceof Uint8Array ? Array.from(t.audio_blob) : t.audio_blob,
+    })),
+  };
+
+  const jsonString = JSON.stringify(exportData, null, 2);
+  const bytes = new TextEncoder().encode(jsonString);
+
+  return {
+    filename: `video-content-factory-workspace-v${FORMAT_VERSION}.json`,
+    bytes,
+  };
+}
+
+async function workspaceImportValidate(payload) {
+  let data = null;
+  let bytes = payload?.bytes;
+
+  if (payload?.data && typeof payload.data === "object") {
+    data = payload.data;
+  } else if (typeof payload?.text === "string" || typeof payload?.json === "string") {
+    try {
+      data = JSON.parse(payload.text || payload.json);
+    } catch (_) {
+      throw new WorkerError("invalid_import", "The selected file is not a valid workspace JSON backup.");
+    }
+  } else {
+    if (!(bytes instanceof Uint8Array)) {
+      if (Array.isArray(bytes)) {
+        bytes = new Uint8Array(bytes);
+      } else if (bytes instanceof ArrayBuffer) {
+        bytes = new Uint8Array(bytes);
+      } else if (bytes && ArrayBuffer.isView(bytes)) {
+        bytes = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      } else {
+        bytes = new Uint8Array(0);
+      }
+    }
+    if (!bytes.byteLength) throw new WorkerError("invalid_import", "Choose a non-empty workspace backup file.");
+
+    try {
+      const text = new TextDecoder().decode(bytes);
+      data = JSON.parse(text);
+    } catch (_) {
+      throw new WorkerError("invalid_import", "The selected file is not a valid workspace JSON backup.");
+    }
+  }
+
+  if (data?.format_id !== FORMAT_ID || data?.format_version !== FORMAT_VERSION) {
+    throw new WorkerError("invalid_import", "The selected workspace format is not supported.");
+  }
+
+  if (!Array.isArray(data.applications) || !Array.isArray(data.companies) || !Array.isArray(data.content_projects)) {
+    throw new WorkerError("invalid_import", "The selected file is missing required workspace tables.");
+  }
+
+  const token = crypto.randomUUID();
+  pendingImport = { token, data };
+
+  return {
+    token,
+    applications: data.applications.length,
+    companies: data.companies.length,
+    projects: data.content_projects.length,
+    message: "Workspace is valid and ready to import.",
+  };
+}
+
+async function workspaceImportCommit(payload) {
+  if (!pendingImport || payload?.token !== pendingImport.token) {
+    throw new WorkerError("invalid_import", "This import approval is stale or unknown. Validate the file again.");
+  }
+
+  const { data } = pendingImport;
+  const storeNames = ["applications", "companies", "content_projects", "drafts", "ai_settings", "audio_tracks", "workspace_meta"];
+  const { stores, tx } = getStores(storeNames, "readwrite");
+
+  for (const name of storeNames) {
+    await reqToPromise(stores[name].clear());
+  }
+
+  if (Array.isArray(data.workspace_meta) && data.workspace_meta.length) {
+    for (const item of data.workspace_meta) await reqToPromise(stores.workspace_meta.add(item));
+  } else {
+    await reqToPromise(stores.workspace_meta.add({ singleton: 1, format_id: FORMAT_ID, format_version: FORMAT_VERSION }));
+  }
+
+  for (const item of data.applications || []) await reqToPromise(stores.applications.add(item));
+  for (const item of data.companies || []) await reqToPromise(stores.companies.add(item));
+  for (const item of data.content_projects || []) await reqToPromise(stores.content_projects.add(item));
+  for (const item of data.drafts || []) await reqToPromise(stores.drafts.add(item));
+  for (const item of data.ai_settings || []) await reqToPromise(stores.ai_settings.add(item));
+
+  for (const item of data.audio_tracks || []) {
+    let blob = item.audio_blob;
+    if (Array.isArray(blob)) blob = new Uint8Array(blob);
+    await reqToPromise(stores.audio_tracks.add({ ...item, audio_blob: blob }));
+  }
+
+  await txDone(tx);
+  pendingImport = null;
+  return { imported: true };
+}
+
+/* ==========================================================================
+ * RPC Dispatcher
+ * ========================================================================== */
 
 async function openWorkspace() {
-  SQL ||= await initSqlJs({ locateFile: (file) => `vendor/sql.js/${file}` });
-  if (db) return { format_id: FORMAT_ID, format_version: FORMAT_VERSION, restored: true };
-  const bytes = await loadPersistedBytes();
-  if (bytes) {
-    const candidate = new SQL.Database(bytes); candidate.run("PRAGMA foreign_keys = ON");
-    try { validateDatabase(candidate); } catch (error) { candidate.close(); throw new WorkerError("persistence_error", "The saved browser workspace could not be opened safely."); }
-    db = candidate; persistedBytes = bytes;
+  if (dbInstance) {
     return { format_id: FORMAT_ID, format_version: FORMAT_VERSION, restored: true };
   }
-  db = freshDatabase();
-  await persistMutation(null);
-  return { format_id: FORMAT_ID, format_version: FORMAT_VERSION, restored: false };
+  await openDatabase();
+  return { format_id: FORMAT_ID, format_version: FORMAT_VERSION, restored: isRestored };
 }
 
 async function dispatch(operation, payload) {
   if (operation === "workspace.open") return openWorkspace();
-  if (!db) throw new WorkerError("validation_error", "Open the workspace before using it.");
-  if (operation === "workspace.export") {
-    const activeBytes = db.export();
-    const tempDb = new SQL.Database(activeBytes);
-    tempDb.run("UPDATE ai_settings SET api_key = ''");
-    const sanitizedBytes = tempDb.export();
-    tempDb.close();
-    return { filename: `video-content-factory-workspace-v${FORMAT_VERSION}.sqlite`, bytes: sanitizedBytes };
-  }
+  if (!dbInstance) throw new WorkerError("validation_error", "Open the workspace before using it.");
+
+  if (operation === "workspace.export") return workspaceExport();
+  if (operation === "workspace.import.validate") return workspaceImportValidate(payload);
+  if (operation === "workspace.import.commit") return workspaceImportCommit(payload);
+  if (operation === "workspace.reset") return workspaceReset(payload);
+
+  // Applications & Companies
+  if (operation === "applications.list") return catalogList("applications");
+  if (operation === "applications.get") return catalogGet("applications", payload);
+  if (operation === "applications.create") return catalogCreate("applications", payload);
+  if (operation === "applications.update") return catalogUpdate("applications", payload);
+  if (operation === "applications.delete") return catalogDelete("applications", payload);
+
+  if (operation === "companies.list") return catalogList("companies");
+  if (operation === "companies.get") return catalogGet("companies", payload);
+  if (operation === "companies.create") return catalogCreate("companies", payload);
+  if (operation === "companies.update") return catalogUpdate("companies", payload);
+  if (operation === "companies.delete") return catalogDelete("companies", payload);
+
+  // Projects
+  if (operation === "projects.list") return projectList();
+  if (operation === "projects.get") return projectDetail(payload?.id);
+  if (operation === "projects.create") return projectCreate(payload);
+  if (operation === "projects.update") return projectUpdate(payload);
+  if (operation === "projects.delete") return projectDelete(payload);
+
+  // Drafts
+  if (operation === "drafts.upsert") return upsertDraft(payload);
+
+  // AI Settings
   if (operation === "ai_settings.get") return aiSettingsGet(payload?.include_key);
-  if (operation === "ai_settings.save") return persistMutation(transaction(() => aiSettingsSave(payload || {})));
-  if (operation === "audio_tracks.save") return persistMutation(transaction(() => audioTracksSave(payload || {})));
+  if (operation === "ai_settings.save") return aiSettingsSave(payload);
+
+  // Audio Tracks
+  if (operation === "audio_tracks.save") return audioTracksSave(payload);
   if (operation === "audio_tracks.list") return audioTracksList(payload?.content_project_id);
   if (operation === "audio_tracks.get") return audioTracksGet(payload?.id);
-  if (operation === "audio_tracks.delete") return persistMutation(transaction(() => audioTracksDelete(payload?.id)));
+  if (operation === "audio_tracks.delete") return audioTracksDelete(payload?.id);
 
-  if (operation === "workspace.import.validate") {
-    const bytes = payload?.bytes instanceof Uint8Array ? payload.bytes : new Uint8Array(payload?.bytes || []);
-    if (!bytes.byteLength) throw new WorkerError("invalid_import", "Choose a non-empty SQLite workspace file.");
-    let candidate;
-    let summary;
-    try {
-      candidate = new SQL.Database(bytes); candidate.run("PRAGMA foreign_keys = ON"); validateDatabase(candidate);
-      summary = {
-        applications: candidate.exec("SELECT count(*) AS count FROM applications")[0].values[0][0],
-        companies: candidate.exec("SELECT count(*) AS count FROM companies")[0].values[0][0],
-        projects: candidate.exec("SELECT count(*) AS count FROM content_projects")[0].values[0][0],
-      };
-    }
-    catch (error) { if (error instanceof WorkerError) throw error; throw new WorkerError("invalid_import", "The selected file is not a readable SQLite workspace."); }
-    finally { candidate?.close(); }
-    const token = crypto.randomUUID(); pendingImport = { token, bytes: new Uint8Array(bytes) };
-    return { token, ...summary, message: "Workspace is valid and ready to import." };
-  }
-  if (operation === "workspace.import.commit") {
-    if (!pendingImport || payload?.token !== pendingImport.token) throw new WorkerError("invalid_import", "This import approval is stale or unknown. Validate the file again.");
-    const candidate = new SQL.Database(pendingImport.bytes); candidate.run("PRAGMA foreign_keys = ON");
-    try { validateDatabase(candidate); await writeWorkspace(pendingImport.bytes); } catch (error) { candidate.close(); if (error instanceof WorkerError) throw error; throw new WorkerError("persistence_error", "The validated workspace could not be saved."); }
-    db.close(); db = candidate; persistedBytes = pendingImport.bytes; pendingImport = null;
-    return { imported: true };
-  }
-  if (operation === "workspace.reset") {
-    if (payload?.confirmed !== true) throw new WorkerError("validation_error", "Confirm sample-data restoration before replacing the workspace.");
-    const candidate = freshDatabase(); const bytes = candidate.export();
-    try { await writeWorkspace(bytes); } catch (_) { candidate.close(); throw new WorkerError("persistence_error", "Sample data could not be saved to the browser workspace."); }
-    db.close(); db = candidate; persistedBytes = bytes; pendingImport = null;
-    return { reset: true };
-  }
-  const match = /^(applications|companies)\.(list|get|create|update|delete)$/.exec(operation);
-  if (match) {
-    const mutation = ["create", "update", "delete"].includes(match[2]);
-    const result = mutation ? transaction(() => catalogOperation(match[1], match[2], payload || {})) : catalogOperation(match[1], match[2], payload || {});
-    return mutation ? persistMutation(result) : result;
-  }
-  const projectMatch = /^projects\.(list|get|create|update|delete)$/.exec(operation);
-  if (projectMatch) {
-    const mutation = ["create", "update", "delete"].includes(projectMatch[1]);
-    const result = mutation ? transaction(() => projectOperation(projectMatch[1], payload || {})) : projectOperation(projectMatch[1], payload || {});
-    return mutation ? persistMutation(result) : result;
-  }
-  if (operation === "drafts.upsert") return persistMutation(transaction(() => upsertDraft(payload || {})));
   throw new WorkerError("validation_error", "Unknown workspace operation.");
 }
 
@@ -481,8 +808,11 @@ self.onmessage = (event) => {
       const result = await dispatch(operation, payload);
       self.postMessage({ id, ok: true, result });
     } catch (error) {
-      const safe = error instanceof WorkerError ? error : new WorkerError("persistence_error", "The browser workspace could not complete that request.");
+      const safe = error instanceof WorkerError
+        ? error
+        : new WorkerError("persistence_error", error?.message || "The browser workspace could not complete that request.");
       self.postMessage({ id, ok: false, error: { code: safe.code, message: safe.message } });
     }
   });
 };
+
