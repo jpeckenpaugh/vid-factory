@@ -1,0 +1,6 @@
+body { min-height: 100vh; }
+.navbar .nav-link.active { color: #fff; font-weight: 600; }
+.record-card { transition: box-shadow .15s ease; }
+.record-card:hover { box-shadow: 0 .4rem 1rem rgba(0,0,0,.1); }
+.draft-body { white-space: pre-wrap; }
+.empty-state { border: 2px dashed var(--bs-border-color); }
