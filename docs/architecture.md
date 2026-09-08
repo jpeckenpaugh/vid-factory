@@ -227,3 +227,164 @@ checks, schema and seed initialization, SQL transactions, API error mapping,
 and static frontend delivery. It must not generate content, contact AI or
 media services, or require a separate database server. Stage 6 implements this
 contract without changing the Stage 4 environment.
+
+## Enhancement: Sprint 01 Browser-Primary Runtime
+
+### Runtime Boundary and Components
+
+Sprint 01 adds a standalone, browser-native implementation under
+`poc-browser/`. It is served only as static files by `poc-browser/serve.py` at
+`http://127.0.0.1:8012`; it does not start, call, read from, or write to the
+FastAPI application. A current Chromium-based browser is required because the
+workspace is stored in Origin Private File System (OPFS).
+
+```text
+poc-browser/
+  index.html                  Bootstrap application shell
+  app.js                      UI rendering, form state, notices, Worker client
+  styles.css                  browser-runtime-specific styling
+  db-worker.js                sql.js ownership, SQL, validation, OPFS I/O
+  serve.py                    development-only static server
+  vendor/sql.js/              pinned sql.js 1.13.0 JS and WASM runtime
+```
+
+`app.js` must communicate only with `db-worker.js` using a request/response
+RPC protocol. It never imports `sql.js`, opens OPFS, or constructs SQL.
+`db-worker.js` is the sole owner of the sql.js database connection and of
+workspace persistence. The Worker loads the pinned vendored sql.js WebAssembly
+asset from `vendor/sql.js/`; no package installation, CDN, or server API is a
+runtime dependency.
+
+The Worker processes one request at a time in arrival order. Each request has
+an ID, an operation name, and optional JSON-safe payload. A successful response
+is `{ "id": "...", "ok": true, "result": ... }`; a failed request is
+`{ "id": "...", "ok": false, "error": { "code": "...", "message": "..." } }`.
+The UI retains form input on errors and shows the returned message. This queue
+only serializes work within one page; multiple tabs are deliberately unsupported.
+
+### Browser Workspace Schema
+
+The browser database contains the baseline `applications`, `companies`,
+`content_projects`, and `drafts` tables with the same columns, constraints,
+foreign-key actions, indexes, timestamp format, normalization, and deterministic
+seed records specified above. Browser behavior therefore preserves the baseline
+rules: catalog names and project titles are trimmed and nonblank; catalog names
+are unique; project associations are optional; deleting a catalog record clears
+its project association; a project delete cascades to its draft; and one project
+has zero or one script-or-prompt draft.
+
+It additionally owns this metadata table:
+
+```sql
+CREATE TABLE workspace_meta (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  format_id TEXT NOT NULL CHECK (format_id = 'video-content-factory-workspace'),
+  format_version INTEGER NOT NULL CHECK (format_version = 1)
+);
+```
+
+Initialization creates the schema with foreign keys enabled, inserts the one
+metadata row, and inserts the deterministic baseline catalog seed rows with
+conflict-safe statements. It never overwrites an existing workspace. This is a
+workspace-format version marker, not a schema-migration mechanism: imports with
+any other ID or version are rejected, and migrations are out of scope.
+
+### Worker Operation Contract
+
+The UI uses these semantic Worker operations instead of the legacy HTTP API.
+All returned resource objects use the baseline JSON field names and shapes
+documented above, including resolved catalog names for projects and `draft` on
+project detail. List ordering matches the baseline API contract.
+
+| Operation | Payload | Result / behavior |
+| --- | --- | --- |
+| `workspace.open` | — | Opens the persistent workspace or creates and seeds it, then returns readiness information. |
+| `applications.list/get/create/update/delete` | Baseline catalog IDs and `{ name }` payloads | Returns catalog resources; delete clears linked project associations. |
+| `companies.list/get/create/update/delete` | Baseline catalog IDs and `{ name }` payloads | Returns catalog resources; delete clears linked project associations. |
+| `projects.list/get/create/update/delete` | Baseline project IDs and complete project payloads | Returns baseline display/detail resources; validates non-null associations. |
+| `drafts.upsert` | project ID plus `{ draft_type, body }` | Creates or updates the project's sole draft and returns it. |
+| `workspace.export` | — | Returns a copy of the current validated SQLite database bytes and export filename metadata. |
+| `workspace.import.validate` | selected SQLite file bytes | Validates bytes in memory and returns a non-persistent import-ready token/summary, or a validation error. |
+| `workspace.import.commit` | import-ready token | Replaces the active workspace only after successful validation and persistence. |
+| `workspace.reset` | explicit confirmation flag | Replaces the active workspace with a newly seeded sample workspace. |
+
+Mutating resource operations run their SQL change and then persist before their
+success response is sent. Validation failures use stable, user-displayable
+codes such as `validation_error`, `not_found`, `conflict`, `invalid_import`,
+and `persistence_error`; they do not expose SQL internals.
+
+### Persistence, Export, and Import Flow
+
+The active workspace is stored as sql.js-exported SQLite bytes in one fixed
+OPFS file. On startup the Worker reads that file if it exists and opens its
+bytes with sql.js; otherwise it creates the initialized database. After every
+successful resource mutation, reset, or accepted import, the Worker exports
+the database bytes and writes a replacement OPFS file. The Worker must not
+return mutation success until that write is complete. If persistence fails, it
+returns `persistence_error`, reloads the last persisted workspace before serving
+another request, and the UI reports that the requested change was not saved.
+
+`workspace.export` exports a byte-for-byte SQLite workspace backup, suggested
+with a `.sqlite` filename. It does not mutate the active workspace. The UI owns
+the browser download interaction after receiving the bytes.
+
+Import is a two-step operation so the user can choose a file, see validation
+feedback, and explicitly complete replacement:
+
+```text
+User selects backup
+  -> UI reads bytes and calls workspace.import.validate
+  -> Worker opens bytes only in memory
+  -> Worker checks integrity, foreign keys, required schema, and workspace_meta
+  -> UI shows accepted/rejected status
+  -> user confirms accepted import
+  -> Worker persists replacement bytes to OPFS and switches active database
+  -> UI reloads catalog/project state
+```
+
+Import validation must run `PRAGMA integrity_check`, `PRAGMA foreign_key_check`,
+verify exactly one compatible `workspace_meta` row, verify the required tables,
+columns, indexes, and baseline constraints, and verify every draft has a valid
+type and nonblank body. Validation retains no active-state side effects. The
+Worker may hold only the most recently validated bytes/token in memory; a stale
+or unknown token must be rejected. An invalid, corrupt, structurally incomplete,
+or incompatible import leaves both the in-memory active database and OPFS file
+unchanged.
+
+Reset follows the same replacement discipline: the UI requires an explicit
+confirmation, the Worker builds a fresh compatible database with only the
+deterministic sample applications and companies, persists it, then makes it
+active. Failed reset persistence leaves the prior workspace active.
+
+### Browser UI State Flow
+
+The standalone Bootstrap SPA retains the three baseline views—Applications,
+Companies, and Content Projects—and adds visible workspace controls for export,
+choose/validate/import, and restore sample data. It loads its initial view only
+after `workspace.open` succeeds. After each successful Worker mutation it
+reloads the affected list or detail from the Worker; it does not maintain an
+independent durable copy of business data. Draft edit state is shown from the
+selected project and is saved through `drafts.upsert`.
+
+```text
+Browser action
+  -> app.js sends one semantic request to db-worker.js
+  -> Worker validates and changes its sql.js SQLite database
+  -> Worker exports bytes and commits them to OPFS
+  -> Worker replies with result only after persistence succeeds
+  -> app.js refreshes affected state and shows success or error feedback
+```
+
+### Unchanged Contracts and Explicitly Deferred Work
+
+The existing `backend/` and `frontend/` implementations, their FastAPI routes
+under `/api`, `backend/data/vid_factory.db`, `requirements.txt`, `install.sh`,
+and `run.sh` remain unchanged in this sprint. They continue to be the parity
+reference and fallback runtime; the browser POC neither extends nor consumes
+their API or database. The legacy HTTP API contract above therefore remains
+valid but is not a contract implemented by `poc-browser/`.
+
+AI/provider calls, synchronization, authentication, cloud deployment,
+multi-tab coordination, browser credential storage, schema migrations, and a
+native SQLite OPFS VFS are explicitly out of scope. The static server is a
+local development launcher, not a production hosting design.
