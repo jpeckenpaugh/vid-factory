@@ -8,7 +8,7 @@
 
 ## Work Completed
 
-Implemented the architecture-authorized standalone browser UI in `poc-browser/`.
+Implemented the architecture-authorized standalone browser UI in `browser-edition/`.
 It provides the baseline Applications, Companies, and Content Projects flows,
 including project draft editing, entirely through the browser workspace Worker.
 It also exposes export, validated import with explicit replacement confirmation,
@@ -16,10 +16,10 @@ and confirmed sample-data restoration.
 
 ## Outputs Produced / Modified
 
-- `poc-browser/index.html` — new Bootstrap browser-workspace application shell.
-- `poc-browser/app.js` — new Worker-RPC-only UI state, rendering, forms, and
+- `browser-edition/index.html` — new Bootstrap browser-workspace application shell.
+- `browser-edition/app.js` — new Worker-RPC-only UI state, rendering, forms, and
   workspace portability controls.
-- `poc-browser/styles.css` — new browser-runtime-specific presentation styles.
+- `browser-edition/styles.css` — new browser-runtime-specific presentation styles.
 
 ## Key Decisions
 
@@ -31,9 +31,9 @@ validation succeeds.
 
 ## Open Questions & Concerns
 
-None. `node --check poc-browser/app.js` and `git diff --check` passed. A live
+None. `node --check browser-edition/app.js` and `git diff --check` passed. A live
 static-server browser check could not run in this sandbox because local socket
-binding is denied; Stage 08 should run the POC through `poc-browser/serve.py`
+binding is denied; Stage 08 should run the POC through `browser-edition/serve.py`
 in Chromium and exercise persistence/import behavior.
 
 ## Status

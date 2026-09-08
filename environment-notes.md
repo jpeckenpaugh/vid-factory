@@ -24,18 +24,18 @@ The development server binds to `http://127.0.0.1:8000` and runs
 
 ## Browser-Native Runtime
 
-The browser-native Video Content Factory in `poc-browser/` is independently
+The browser-native Video Content Factory in `browser-edition/` is independently
 served as static files. It does not use the FastAPI process, its API, or its
 SQLite database. From the repository root, run:
 
 ```sh
-python3 poc-browser/serve.py --port 8012
+python3 browser-edition/serve.py --port 8012
 ```
 
 Open `http://127.0.0.1:8012` in a current Chromium-compatible browser.
 `localhost` provides the secure local context required by OPFS browser storage.
 The POC vendors the pinned `sql.js` 1.13.0 JavaScript and WebAssembly runtime
-under `poc-browser/vendor/sql.js/`; no Node.js toolchain, package installation,
+under `browser-edition/vendor/sql.js/`; no Node.js toolchain, package installation,
 or runtime CDN access is required.
 
 ## Caveats

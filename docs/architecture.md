@@ -233,13 +233,13 @@ contract without changing the Stage 4 environment.
 ### Runtime Boundary and Components
 
 Sprint 01 adds a standalone, browser-native implementation under
-`poc-browser/`. It is served only as static files by `poc-browser/serve.py` at
+`browser-edition/`. It is served only as static files by `browser-edition/serve.py` at
 `http://127.0.0.1:8012`; it does not start, call, read from, or write to the
 FastAPI application. A current Chromium-based browser is required because the
 workspace is stored in Origin Private File System (OPFS).
 
 ```text
-poc-browser/
+browser-edition/
   index.html                  Bootstrap application shell
   app.js                      UI rendering, form state, notices, Worker client
   styles.css                  browser-runtime-specific styling
@@ -382,7 +382,7 @@ under `/api`, `backend/data/vid_factory.db`, `requirements.txt`, `install.sh`,
 and `run.sh` remain unchanged in this sprint. They continue to be the parity
 reference and fallback runtime; the browser POC neither extends nor consumes
 their API or database. The legacy HTTP API contract above therefore remains
-valid but is not a contract implemented by `poc-browser/`.
+valid but is not a contract implemented by `browser-edition/`.
 
 AI/provider calls, synchronization, authentication, cloud deployment,
 multi-tab coordination, browser credential storage, schema migrations, and a

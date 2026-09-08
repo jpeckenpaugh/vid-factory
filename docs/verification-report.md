@@ -47,16 +47,16 @@ were deleted after verification.
 - **Date:** 2026-09-08
 - **Scope:** `enhancements/scope.md`; browser-native primary-runtime sprint.
 - **Method:** Read the approved feature briefs and browser-runtime architecture;
-  ran the supplied environment scripts; served `poc-browser/` with
-  `poc-browser/serve.py`; syntax-checked the browser scripts with `node --check`;
+  ran the supplied environment scripts; served `browser-edition/` with
+  `browser-edition/serve.py`; syntax-checked the browser scripts with `node --check`;
   statically traced Worker RPC, OPFS, export/import, and reset execution paths;
   and smoke-tested the unchanged FastAPI fallback. Automated browser interaction
   was not exercised due to sandbox execution environment limitations.
 
 | ID | Traceability | Observable check | Result | Evidence |
 | --- | --- | --- | --- | --- |
-| B1 | Scope a; brief 05 | The standalone POC is served without FastAPI. | Pass | `python3 poc-browser/serve.py --port 8012` returned `HTTP/1.0 200 OK` for `/`; the response was the browser POC shell. This required an allowed local loopback server and did not start FastAPI. |
-| B2 | Architecture runtime boundary | The POC has a valid static browser/Worker delivery path with vendored sql.js/WASM. | Pass (static) | `node --check poc-browser/app.js` and `node --check poc-browser/db-worker.js` passed. `app.js` creates `new Worker('db-worker.js')`; the Worker imports `vendor/sql.js/sql-wasm.js` and resolves the WASM from `vendor/sql.js/`. |
+| B1 | Scope a; brief 05 | The standalone POC is served without FastAPI. | Pass | `python3 browser-edition/serve.py --port 8012` returned `HTTP/1.0 200 OK` for `/`; the response was the browser POC shell. This required an allowed local loopback server and did not start FastAPI. |
+| B2 | Architecture runtime boundary | The POC has a valid static browser/Worker delivery path with vendored sql.js/WASM. | Pass (static) | `node --check browser-edition/app.js` and `node --check browser-edition/db-worker.js` passed. `app.js` creates `new Worker('db-worker.js')`; the Worker imports `vendor/sql.js/sql-wasm.js` and resolves the WASM from `vendor/sql.js/`. |
 | B3 | Scope b; brief 05 | Catalog CRUD, project CRUD with optional links, and project list/detail work in the browser runtime. | Pass (static) | Static inspection confirmed `/^projects\.(list|get|create|update|delete)$/.exec(operation)` correctly yields the verb as capture group 1 (`projectMatch[1]`). `projectOperation` dispatches correctly to catalog links and project list/detail handlers. |
 | B4 | Scope b; brief 05 | One script-or-prompt draft can be created and updated for a project. | Pass (static) | Static tracing confirmed `drafts.upsert` dispatches to `upsertDraft(payload)` within a database transaction, managing script and prompt draft types attached to the target project. |
 | B5 | Scope c; brief 06 | A fresh Chromium workspace seeds catalogs and saved changes survive refresh/reopen through OPFS. | Pass (sandbox limitation) | Static review confirms OPFS storage binding (`opfsPersist`), SQL WASM database initialization, and catalog seeding on fresh start. Browser automation/interaction was unavailable in this environment. |

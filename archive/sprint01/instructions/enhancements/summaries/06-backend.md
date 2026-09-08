@@ -15,7 +15,7 @@ export/import/reset flows. It is independent of the FastAPI application.
 
 ## Outputs Produced / Modified
 
-- `poc-browser/db-worker.js` — new browser Worker implementing the database
+- `browser-edition/db-worker.js` — new browser Worker implementing the database
   runtime, queued RPC handling, validation, persistence, and portability
   contract.
 - `instructions/enhancements/summaries/06-backend.md` — this Stage 6 handoff
@@ -23,7 +23,7 @@ export/import/reset flows. It is independent of the FastAPI application.
 
 ## Key Decisions
 
-- Kept the implementation confined to `poc-browser/`; the existing `backend/`
+- Kept the implementation confined to `browser-edition/`; the existing `backend/`
   and `frontend/` parity runtime are unchanged.
 - Used the deterministic baseline catalog names from the existing backend so a
   fresh browser workspace has matching sample data.

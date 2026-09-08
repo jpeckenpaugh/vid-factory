@@ -8,7 +8,7 @@ reference and fallback during this sprint.
 
 ## Sprint concepts
 
-a. Add a browser-only application under `poc-browser/` that runs without a
+a. Add a browser-only application under `browser-edition/` that runs without a
    FastAPI process.
 
 b. Preserve the current MVP behavior: seeded applications and companies,

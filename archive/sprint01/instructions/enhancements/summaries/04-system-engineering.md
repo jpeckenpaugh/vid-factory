@@ -15,9 +15,9 @@ existing FastAPI environment remains unchanged as the parity fallback.
 
 ## Outputs Produced / Modified
 
-- `poc-browser/serve.py` — new local-only static server that binds to loopback,
+- `browser-edition/serve.py` — new local-only static server that binds to loopback,
   serves WebAssembly with the correct MIME type, and disables asset caching.
-- `poc-browser/vendor/sql.js/` — new vendored sql.js 1.13.0 JavaScript,
+- `browser-edition/vendor/sql.js/` — new vendored sql.js 1.13.0 JavaScript,
   WebAssembly, license, and provenance/checksum documentation.
 - `environment-notes.md` — extended with the standalone browser POC run
   contract and explicit separation from the legacy FastAPI scripts.

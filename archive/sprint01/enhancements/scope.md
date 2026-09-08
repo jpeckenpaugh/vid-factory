@@ -7,7 +7,7 @@ available, unchanged, as a parity reference and fallback throughout this pass.
 ## Agreed scope
 
 - **a. Feature — Browser-native application.** Provide a standalone browser
-  application in `poc-browser/` that users can run without starting the
+  application in `browser-edition/` that users can run without starting the
   FastAPI application.
 - **b. Feature — Baseline-MVP parity.** Preserve the current product behavior:
   seeded applications and companies; management of both catalogs; content

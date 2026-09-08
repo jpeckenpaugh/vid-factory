@@ -10,7 +10,7 @@
 
 Completed Stage 08 Verification for Sprint 01 (Browser Primary Runtime).
 Verified static code delivery, RPC dispatching, draft upsert logic, OPFS storage binding, export/import validation, reset handlers, and legacy FastAPI fallback preservation.
-Confirmed that B3 in `poc-browser/db-worker.js` was a false positive (`projectMatch[1]` correctly yields the verb `'list'`) and updated B3/B4 to Pass.
+Confirmed that B3 in `browser-edition/db-worker.js` was a false positive (`projectMatch[1]` correctly yields the verb `'list'`) and updated B3/B4 to Pass.
 Documented B5 and B6 browser automation constraints as acceptable sandbox environment limitations, matching the V11 server watcher limitation pattern.
 
 ## Outputs Produced / Modified

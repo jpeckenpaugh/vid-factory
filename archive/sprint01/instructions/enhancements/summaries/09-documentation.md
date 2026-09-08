@@ -9,7 +9,7 @@
 ## Work Completed
 
 Completed Stage 09 Documentation close-out for Sprint 01 (Browser Primary Runtime).
-Updated `README.md` to reflect the newly established browser-native application in `poc-browser/` as the primary local runtime, while preserving complete setup and execution instructions for the unchanged FastAPI backend and Bootstrap frontend fallback (`backend/`, `frontend/`).
+Updated `README.md` to reflect the newly established browser-native application in `browser-edition/` as the primary local runtime, while preserving complete setup and execution instructions for the unchanged FastAPI backend and Bootstrap frontend fallback (`backend/`, `frontend/`).
 Recorded full implementation details for the browser database worker, OPFS storage persistence, RPC protocol, export/import validation, and reset handlers.
 Documented current project status, Sprint 01 verification outcome ("Pass with sandbox environment limitations"), pre-existing baseline verification status, known environment and browser limitations, and recommended future next actions.
 
@@ -20,7 +20,7 @@ Documented current project status, Sprint 01 verification outcome ("Pass with sa
 
 ## Key Decisions
 
-- Documented `poc-browser/` as the primary local runtime per `enhancements/scope.md`, while maintaining `backend/` and `frontend/` as a parity reference and fallback.
+- Documented `browser-edition/` as the primary local runtime per `enhancements/scope.md`, while maintaining `backend/` and `frontend/` as a parity reference and fallback.
 - Accurately recorded verification outcome as "Pass with sandbox environment limitations", explicitly noting headless browser automation constraints (B5/B6) and server watcher reload permissions (B8/V11) without altering upstream findings or repairing facts.
 
 ## Open Questions & Concerns

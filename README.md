@@ -1,12 +1,12 @@
 # Video Content Factory
 
-Video Content Factory is a web application for organizing early-stage content ideas and drafts. It provides a browser-native standalone application (`poc-browser/`) as its primary local runtime, using in-browser SQLite WASM with OPFS persistence. The original FastAPI JSON API and Bootstrap browser UI (`backend/` and `frontend/`) remain fully available, unchanged, as a parity reference and fallback runtime.
+Video Content Factory is a web application for organizing early-stage content ideas and drafts. It provides a browser-native standalone application (`browser-edition/`) as its primary local runtime, using in-browser SQLite WASM with OPFS persistence. The original FastAPI JSON API and Bootstrap browser UI (`backend/` and `frontend/`) remain fully available, unchanged, as a parity reference and fallback runtime.
 
 Advanced agentic automation, AI-generated content, and visual or video asset creation are intentionally deferred to future passes.
 
 ## What is included
 
-- **Browser-Native Primary Runtime (`poc-browser/`)**: A client-side application running entirely in the browser without requiring a backend server.
+- **Browser-Native Primary Runtime (`browser-edition/`)**: A client-side application running entirely in the browser without requiring a backend server.
   - Dedicated Web Worker database layer using vendored `sql.js` (SQLite compiled to WebAssembly).
   - Persistent local storage using the Origin Private File System (OPFS).
   - High-level RPC message-passing protocol between the browser UI (`app.js`) and database worker (`db-worker.js`).
@@ -14,7 +14,7 @@ Advanced agentic automation, AI-generated content, and visual or video asset cre
   - Content project management with optional application and company links.
   - One persisted script or prompt draft per project.
   - Workspace portability and recovery: export workspace database to JSON file, validate and import workspace JSON, and reset workspace to initial seed state.
-  - Lightweight Python static file server helper (`poc-browser/serve.py`).
+  - Lightweight Python static file server helper (`browser-edition/serve.py`).
 - **FastAPI Reference & Fallback Runtime (`backend/`, `frontend/`)**:
   - Seeded, persisted catalogs for applications and companies in a local SQLite database (`backend/data/vid_factory.db`).
   - Create, view, edit, and delete actions for catalogs, content projects, and drafts.
@@ -22,17 +22,17 @@ Advanced agentic automation, AI-generated content, and visual or video asset cre
 
 ## Requirements
 
-- **Primary Browser Runtime**: Modern Chromium-based browser (Chrome, Edge, Brave) supporting Web Workers and Origin Private File System (OPFS). Python 3.12 (optional, used only for the local static HTTP server `poc-browser/serve.py`).
+- **Primary Browser Runtime**: Modern Chromium-based browser (Chrome, Edge, Brave) supporting Web Workers and Origin Private File System (OPFS). Python 3.12 (optional, used only for the local static HTTP server `browser-edition/serve.py`).
 - **Fallback FastAPI Runtime**: Python 3.12 with standard library SQLite support.
 
 ## Setup and run
 
 ### Primary Runtime: Standalone Browser Application
 
-Serve the `poc-browser/` static files locally using the built-in HTTP server:
+Serve the `browser-edition/` static files locally using the built-in HTTP server:
 
 ```sh
-python3 poc-browser/serve.py --port 8012
+python3 browser-edition/serve.py --port 8012
 ```
 
 Then open [http://127.0.0.1:8012](http://127.0.0.1:8012) in a supported browser.
@@ -57,7 +57,7 @@ Then open [http://127.0.0.1:8000](http://127.0.0.1:8000). The SQLite database is
 
 ## Implementation summary
 
-### Browser-Native Runtime (`poc-browser/`)
+### Browser-Native Runtime (`browser-edition/`)
 The browser runtime is structured with a strict separation between UI presentation (`app.js`) and database execution (`db-worker.js`):
 - **UI Shell (`index.html`, `app.js`, `styles.css`)**: Manages navigation (Applications, Companies, Projects views), modal forms, export/import UI, reset controls, and reactive view rendering after RPC responses.
 - **Database Worker (`db-worker.js`)**: Executes in a Web Worker thread, loading SQLite WASM via `vendor/sql.js/sql-wasm.js`. All database operations run inside transactions.
