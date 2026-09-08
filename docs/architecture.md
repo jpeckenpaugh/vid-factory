@@ -388,3 +388,120 @@ AI/provider calls, synchronization, authentication, cloud deployment,
 multi-tab coordination, browser credential storage, schema migrations, and a
 native SQLite OPFS VFS are explicitly out of scope. The static server is a
 local development launcher, not a production hosting design.
+
+## Enhancement: Sprint 02 Client-Side AI & Dialogue TTS
+
+### Overview and Scope Boundary
+
+Sprint 02 extends `browser-edition/` with client-side AI script generation and browser-native dialogue Text-to-Speech (TTS) synthesis using `kokoro-js` running in WebAssembly / WebGPU. All generated assets (audio binary tracks) and AI provider settings persist locally in the browser workspace without requiring backend server processing or speech routes.
+
+The existing FastAPI fallback backend (`backend/`, `frontend/`) and baseline catalog/project CRUD workflows remain unchanged.
+
+### Architecture Components and File Layout
+
+```text
+browser-edition/
+  index.html                  Bootstrap shell with Settings view & TTS controls
+  app.js                      UI handlers, AI provider client, worker dispatchers
+  styles.css                  TTS audio player and parameter control styles
+  db-worker.js                sql.js database owner, extended with ai_settings & audio_tracks
+  tts-worker.js               Web Worker owning kokoro-js, WASM/WebGPU pipeline, model caching
+  serve.py                    static asset development server
+```
+
+The system separates database concerns (`db-worker.js`) from computationally heavy ML/audio synthesis (`tts-worker.js`) to guarantee main-thread responsiveness and prevent database transaction contention.
+
+### Data Model and Browser Schema Extensions
+
+The local SQLite schema in `db-worker.js` is extended with two new tables:
+
+```sql
+CREATE TABLE ai_settings (
+  provider TEXT PRIMARY KEY CHECK (provider IN ('Gemini', 'OpenAI', 'Ollama')),
+  api_key TEXT NOT NULL DEFAULT '',
+  endpoint TEXT NOT NULL DEFAULT '',
+  is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)),
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE audio_tracks (
+  id INTEGER PRIMARY KEY,
+  content_project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+  voice_id TEXT NOT NULL CHECK (length(trim(voice_id)) > 0),
+  speed REAL NOT NULL CHECK (speed >= 0.75 AND speed <= 1.25),
+  script_snapshot TEXT NOT NULL CHECK (length(trim(script_snapshot)) > 0),
+  duration REAL NOT NULL CHECK (duration >= 0.0),
+  audio_blob BLOB NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_audio_tracks_content_project_id
+  ON audio_tracks(content_project_id);
+```
+
+- **`ai_settings`**: Stores provider credentials (`api_key` masked in UI) and base URL overrides. Exactly one provider row may have `is_active = 1`.
+- **`audio_tracks`**: Stores synthesized binary audio streams (`BLOB`) alongside synthesis metadata. Deleting a content project automatically cascades and deletes linked audio tracks. Multiple audio tracks may be stored per project, with the latest created track treated as active preview.
+
+### Worker Operations & API Contracts
+
+#### Database Worker (`db-worker.js`) Extended Operations
+
+| Operation | Payload | Result / behavior |
+| --- | --- | --- |
+| `ai_settings.get` | — | Returns all provider configs and active provider status (API key masked unless explicitly requested). |
+| `ai_settings.save` | `{ provider, api_key, endpoint, is_active }` | Upserts settings for provider and updates `is_active` flags idempotently. |
+| `audio_tracks.save` | `{ content_project_id, voice_id, speed, script_snapshot, duration, audio_blob }` | Persists binary audio track and metadata; returns saved record metadata. |
+| `audio_tracks.list` | `{ content_project_id }` | Returns audio track metadata (excluding blob) for a project ordered by `created_at DESC`. |
+| `audio_tracks.get` | `{ id }` | Returns full audio track including `audio_blob`. |
+| `audio_tracks.delete` | `{ id }` | Deletes specified audio track record. |
+
+#### TTS Worker (`tts-worker.js`) RPC Protocol
+
+`app.js` interacts with `tts-worker.js` via asynchronous postMessage RPC:
+
+```text
+Message Request:
+  { id: "req-1", action: "init" | "synthesize", payload: { ... } }
+
+Progress Event (from Worker):
+  { action: "progress", payload: { status: "loading_model" | "synthesizing", progress: 0.45, text: "..." } }
+
+Response (from Worker):
+  { id: "req-1", ok: true, result: { audio_blob: ArrayBuffer, duration: 12.4, sample_rate: 24000 } }
+  { id: "req-1", ok: false, error: { code: "wasm_error" | "unsupported_voice", message: "..." } }
+```
+
+### Client-Side AI Script Generator Flow
+
+1. User opens AI Script Generator modal/section in project draft editor.
+2. `app.js` retrieves active settings via `ai_settings.get`. If `is_active` is missing or `api_key` is empty (for cloud providers), user is prompted to configure Settings.
+3. User enters script topic prompt. `app.js` makes direct client-side fetch to chosen provider:
+   - **Gemini**: REST endpoint `https://generativelanguage.googleapis.com/v1beta/models/...`
+   - **OpenAI**: REST endpoint `https://api.openai.com/v1/chat/completions`
+   - **Ollama**: Configured endpoint (e.g. `http://localhost:11434/api/generate`)
+4. UI displays inline loading feedback.
+5. If project draft already contains text, UI presents confirmation modal ("Replace existing draft?").
+6. Upon approval, generated text is assigned to draft body and saved via `drafts.upsert`.
+
+### Client-Side TTS Synthesis & Audio Preview Flow
+
+1. User selects voice (`af_heart`, `af_bella`, `am_adam`, `am_michael`) and speed multiplier ($0.75\times$ to $1.25\times$).
+2. User clicks "Synthesize Audio". `app.js` posts `synthesize` message to `tts-worker.js`.
+3. `tts-worker.js` checks IndexedDB/OPFS cache for Kokoro model weights:
+   - If missing, fetches ONNX/WASM weights with progress messages back to main UI thread.
+   - Executes speech synthesis in WebAssembly / WebGPU worker context.
+4. `tts-worker.js` returns binary PCM/WAV buffer and duration to `app.js`.
+5. `app.js` posts `audio_tracks.save` payload to `db-worker.js` to persist audio in SQLite OPFS workspace.
+6. `app.js` creates Object URL (`URL.createObjectURL(blob)`) and updates HTML5 audio preview player with waveform/duration playback controls.
+
+### Workspace Export & Import Security Boundary
+
+- **Export Security**: When `workspace.export` is invoked, `db-worker.js` generates the `.sqlite` file export containing `applications`, `companies`, `content_projects`, `drafts`, and `audio_tracks`.
+- Before exporting bytes, `db-worker.js` strips/clears `api_key` fields in `ai_settings` to ensure API keys are never included in portable exported workspace packages.
+- **Import Handling**: `workspace.import.validate` verifies table constraints on `audio_tracks` and `ai_settings`. Imported `ai_settings` without API keys require users to re-enter keys after import.
+
+### Unchanged Contracts & Out-of-Scope Capabilities
+
+- Backend Python code (`backend/`), FastAPI endpoints, and fallback static client (`frontend/`) are unaffected.
+- Server-side speech generation, multi-speaker voice timeline sync, audio fine-tuning, and cloud synchronization are explicitly out of scope.
+
