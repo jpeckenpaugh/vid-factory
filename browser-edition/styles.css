@@ -2,6 +2,18 @@ body { min-height: 100vh; }
 .navbar .nav-link.active { color: #fff; font-weight: 600; }
 .record-card { transition: box-shadow .15s ease; }
 .record-card:hover { box-shadow: 0 .4rem 1rem rgba(0,0,0,.1); }
-.draft-body { white-space: pre-wrap; }
+.draft-body { white-space: pre-wrap; font-family: var(--bs-font-monospace); font-size: 0.9rem; }
 .empty-state { border: 2px dashed var(--bs-border-color); }
 .workspace-actions { font-size: .875rem; }
+
+/* AI Settings & Generation Styles */
+.provider-badge { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+.ai-generator-box { background-color: var(--bs-light-bg-subtle); border-left: 4px solid var(--bs-primary); }
+
+/* TTS Studio Styles */
+.tts-controls { background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 0.5rem; }
+.audio-preview-card { background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); }
+.audio-history-item { transition: background-color 0.15s ease-in-out; }
+.audio-history-item:hover { background-color: #f1f3f5; }
+
+.speed-readout { font-weight: bold; min-width: 3.5rem; text-align: right; }
