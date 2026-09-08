@@ -76,3 +76,33 @@ The existing fallback run-script watcher limitation (B8) is environmental and pr
 
 **Pass with sandbox environment limitations.** All verified browser-primary runtime implementation checks passed via static syntax checking, static code tracing, and local HTTP serving. Automated browser interaction (B5, B6) and file-watching reload for the fallback server (B8) are restricted by sandbox limitations.
 
+## Sprint 02 Client-Side AI & Dialogue TTS Verification
+
+- **Date:** 2026-09-08
+- **Scope:** `enhancements/scope.md`; Sprint 02 Client-Side AI & Dialogue TTS sprint.
+- **Method:** Read approved specifications (`enhancements/scope.md`, `features/briefs/01-05.md`, `docs/architecture.md`); performed static code tracing of UI event handlers (`browser-edition/app.js`), database worker OPFS persistence & schema extensions (`browser-edition/db-worker.js`), and TTS worker RPC postMessage flow (`browser-edition/tts-worker.js`); validated JavaScript syntax via `node --check`; and ran non-reload API regression smoke tests against the fallback FastAPI backend (`backend/main.py`). Browser UI interaction, WebAssembly/WebGPU `kokoro-js` model execution, and OPFS persistence were documented as sandbox limitations.
+
+| ID | Traceability | Observable check | Result | Evidence |
+| --- | --- | --- | --- | --- |
+| S2-1 | Scope a; brief 01; architecture ai_settings contract | Workspace Settings UI allows selecting AI provider (Gemini, OpenAI, Ollama), setting API keys/endpoints, and persisting config in local SQLite `ai_settings` table. | Pass (static review) | `node --check browser-edition/app.js` and `db-worker.js` passed. `db-worker.js` creates `ai_settings` table and implements `ai_settings.get` and `ai_settings.save` RPC operations. `app.js` provides settings modal handlers and masks API keys by default. Browser UI interaction was not automated due to sandbox limitations. |
+| S2-2 | Scope b; brief 02; architecture AI Script Generator contract | AI Script Generator calls active provider client-side, prompts for replacement confirmation if draft text exists, and upserts generated script into draft editor. | Pass (static review) | `app.js` implements direct client-side fetch methods for Gemini, OpenAI, and Ollama REST APIs. It checks active settings via `ai_settings.get`, displays replacement confirmation modal if draft content is present, and calls `drafts.upsert` upon acceptance. Browser UI interaction was not automated due to sandbox limitations. |
+| S2-3 | Scope c; brief 03; architecture tts-worker RPC contract | Client-side TTS synthesis offloads `kokoro-js` WebAssembly/WebGPU model execution to `tts-worker.js` with progress events and caches model weights locally. | Pass (static review / sandbox limitation) | `node --check browser-edition/tts-worker.js` passed. `tts-worker.js` receives `init` and `synthesize` RPC messages over postMessage, sends `progress` status updates, and executes speech inference using `kokoro-js`. WebGPU/WASM execution in headless browser was restricted in this sandbox. |
+| S2-4 | Scope d; brief 04; architecture TTS controls & audio preview contract | TTS UI provides voice selection (`af_heart`, `af_bella`, `am_adam`, `am_michael`), speed controls bounded between $0.75\times$ and $1.25\times$, and inline HTML5 audio preview playback. | Pass (static review) | `app.js` renders voice selection dropdown and enforces speed slider constraints ($0.75\times$–$1.25\times$). Upon synthesis completion, `URL.createObjectURL` initializes the inline HTML5 audio element with playback controls and metadata badge display. Browser UI interaction was not automated due to sandbox limitations. |
+| S2-5 | Scope e; brief 05; architecture audio_tracks schema contract | Synthesized audio binary blobs and synthesis metadata (`voice_id`, `speed`, `script_snapshot`, `duration`) persist in `audio_tracks` table and survive page reloads. | Pass (static review / sandbox limitation) | `db-worker.js` creates `audio_tracks` table with foreign key reference `ON DELETE CASCADE` to `content_projects`. Implements `audio_tracks.save`, `audio_tracks.list`, `audio_tracks.get`, and `audio_tracks.delete`. OPFS storage binding was not exercised via headless browser in this sandbox. |
+| S2-6 | Scope e; brief 05; architecture export security boundary | Exporting workspace packages includes `audio_tracks` binary data while automatically stripping API keys from `ai_settings`. | Pass (static review) | `db-worker.js` `workspace.export` handler serializes `audio_tracks` table into SQLite export bytes while executing `UPDATE ai_settings SET api_key = ''` before byte serialization. `workspace.import.validate` verifies table constraints on `audio_tracks` and `ai_settings`. |
+| S2-7 | Scope f; brief 05; architecture unchanged contracts | Existing FastAPI fallback backend (`backend/`, `frontend/`) and catalog/project CRUD workflows remain unchanged and unregressed. | Pass | `git diff --quiet main..HEAD -- backend/ frontend/ requirements.txt install.sh run.sh` confirmed zero fallback code modification. Non-reload Uvicorn process served `200` responses with valid JSON for `GET /api/applications`, `GET /api/companies`, and `GET /api/projects`. |
+| S2-8 | Stage 4 environment contract | `./run.sh` starts the fallback runtime in this environment. | Fail (sandbox limitation) | `./run.sh` reached Uvicorn reload setup then returned `ERROR: [Errno 1] Operation not permitted` due to sandbox filesystem-watch restrictions, matching pre-existing V11 and B8 findings. Non-reload Uvicorn smoke in S2-7 passed cleanly. |
+
+### Failures and Limitations
+
+No application implementation defects were identified.
+
+Automated browser interaction, WebAssembly/WebGPU `kokoro-js` execution, and OPFS storage (S2-1, S2-2, S2-3, S2-4, S2-5) could not be executed because browser automation capabilities are restricted in this sandbox environment. These are documented as acceptable sandbox environment limitations matching prior convention.
+
+The fallback run-script watcher limitation (S2-8) is environmental and pre-existing (identical to V11 and B8); the non-reload fallback API smoke passed cleanly.
+
+### Sprint 02 Result
+
+**Pass with sandbox environment limitations.** All verified Sprint 02 Client-Side AI & Dialogue TTS implementation checks passed via static syntax validation (`node --check`), static code tracing, and fallback API regression smoke testing. Automated browser UI testing, WASM model execution, and file-watching reload for the fallback server are restricted by sandbox environment limitations.
+
+
