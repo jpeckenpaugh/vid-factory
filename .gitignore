@@ -1,1 +1,23 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local application state
+*.db
+*.sqlite
+*.sqlite3
+
+# Local logs and temporary stage output
+tmp/*
+!tmp/.gitkeep
+*.log
+
+# Operating system and editor files
 .DS_Store
+.idea/
+.vscode/
