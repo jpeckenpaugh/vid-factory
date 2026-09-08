@@ -282,6 +282,112 @@ async function initializeTTS() {
   }
 }
 
+// Split long script text into natural sentence/clause chunks under token limit
+function splitTextIntoChunks(text, maxChars = 240) {
+  const cleaned = text.trim();
+  if (!cleaned) return [];
+  if (cleaned.length <= maxChars) return [cleaned];
+
+  const paragraphs = cleaned.split(/\n+/);
+  const chunks = [];
+
+  for (const para of paragraphs) {
+    const trimmedPara = para.trim();
+    if (!trimmedPara) continue;
+
+    if (trimmedPara.length <= maxChars) {
+      chunks.push(trimmedPara);
+      continue;
+    }
+
+    const sentenceRegex = /[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g;
+    const sentences = trimmedPara.match(sentenceRegex) || [trimmedPara];
+    let currentChunk = "";
+
+    for (const sentence of sentences) {
+      const trimmedSentence = sentence.trim();
+      if (!trimmedSentence) continue;
+
+      if ((currentChunk + " " + trimmedSentence).trim().length <= maxChars) {
+        currentChunk = (currentChunk + " " + trimmedSentence).trim();
+      } else {
+        if (currentChunk) {
+          chunks.push(currentChunk);
+          currentChunk = "";
+        }
+
+        if (trimmedSentence.length > maxChars) {
+          const clauseRegex = /[^,;:—]+[,;:—]+(?:\s+|$)|[^,;:—]+$/g;
+          const clauses = trimmedSentence.match(clauseRegex) || [trimmedSentence];
+
+          for (const clause of clauses) {
+            const trimmedClause = clause.trim();
+            if (!trimmedClause) continue;
+
+            if ((currentChunk + " " + trimmedClause).trim().length <= maxChars) {
+              currentChunk = (currentChunk + " " + trimmedClause).trim();
+            } else {
+              if (currentChunk) {
+                chunks.push(currentChunk);
+                currentChunk = "";
+              }
+
+              if (trimmedClause.length > maxChars) {
+                const words = trimmedClause.split(/\s+/);
+                for (const word of words) {
+                  if ((currentChunk + " " + word).trim().length <= maxChars) {
+                    currentChunk = (currentChunk + " " + word).trim();
+                  } else {
+                    if (currentChunk) chunks.push(currentChunk);
+                    currentChunk = word;
+                  }
+                }
+              } else {
+                currentChunk = trimmedClause;
+              }
+            }
+          }
+        } else {
+          currentChunk = trimmedSentence;
+        }
+      }
+    }
+
+    if (currentChunk) {
+      chunks.push(currentChunk);
+    }
+  }
+
+  return chunks.filter((c) => c.length > 0);
+}
+
+// Concatenate multiple Float32Array audio segments with optional silence pause between them
+function concatenateFloat32Arrays(arrays, pauseSamples = 0) {
+  if (arrays.length === 0) return new Float32Array(0);
+  if (arrays.length === 1 && pauseSamples === 0) return arrays[0];
+
+  let totalLength = 0;
+  for (let i = 0; i < arrays.length; i++) {
+    totalLength += arrays[i].length;
+    if (i < arrays.length - 1) {
+      totalLength += pauseSamples;
+    }
+  }
+
+  const result = new Float32Array(totalLength);
+  let offset = 0;
+
+  for (let i = 0; i < arrays.length; i++) {
+    result.set(arrays[i], offset);
+    offset += arrays[i].length;
+    if (i < arrays.length - 1 && pauseSamples > 0) {
+      offset += pauseSamples;
+    }
+  }
+
+  return result;
+}
+
 async function synthesizeSpeech(payload) {
   const text = payload?.text?.trim();
   if (!text) {
@@ -306,22 +412,40 @@ async function synthesizeSpeech(payload) {
 
   if (kokoroModel && typeof kokoroModel.generate === "function") {
     try {
-      postProgress("synthesizing", 0.4, "Synthesizing dialogue audio with Kokoro TTS model...");
-      const audioResult = await kokoroModel.generate(text, { voice: voiceId, speed });
-      postProgress("synthesizing", 0.85, "Encoding audio buffer...");
-
-      let floatSamples = null;
+      const chunks = splitTextIntoChunks(text, 240);
+      const chunkAudioArrays = [];
       let sRate = DEFAULT_SAMPLE_RATE;
 
-      if (audioResult?.audio instanceof Float32Array) {
-        floatSamples = audioResult.audio;
-        sRate = audioResult.sampling_rate || DEFAULT_SAMPLE_RATE;
-      } else if (audioResult instanceof Float32Array) {
-        floatSamples = audioResult;
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        const progressRatio = 0.2 + 0.65 * (i / chunks.length);
+        const chunkMsg = chunks.length > 1
+          ? `Synthesizing part ${i + 1} of ${chunks.length} with Kokoro TTS model...`
+          : "Synthesizing dialogue audio with Kokoro TTS model...";
+        postProgress("synthesizing", parseFloat(progressRatio.toFixed(2)), chunkMsg);
+
+        const audioResult = await kokoroModel.generate(chunk, { voice: voiceId, speed });
+
+        let floatSamples = null;
+        if (audioResult?.audio instanceof Float32Array) {
+          floatSamples = audioResult.audio;
+          sRate = audioResult.sampling_rate || DEFAULT_SAMPLE_RATE;
+        } else if (audioResult instanceof Float32Array) {
+          floatSamples = audioResult;
+        }
+
+        if (floatSamples && floatSamples.length > 0) {
+          chunkAudioArrays.push(floatSamples);
+        }
       }
 
-      if (floatSamples) {
-        const wavRes = pcmFloatToWavBuffer(floatSamples, sRate);
+      if (chunkAudioArrays.length > 0) {
+        postProgress("synthesizing", 0.9, "Encoding complete audio buffer...");
+        // 0.06s natural silence between sentence chunks
+        const pauseSamples = chunks.length > 1 ? Math.floor(0.06 * sRate) : 0;
+        const combinedFloatSamples = concatenateFloat32Arrays(chunkAudioArrays, pauseSamples);
+        const wavRes = pcmFloatToWavBuffer(combinedFloatSamples, sRate);
+
         postProgress("synthesizing", 1.0, "Audio synthesis complete.");
         return {
           audio_blob: wavRes.buffer,
