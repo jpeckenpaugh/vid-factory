@@ -1,0 +1,1 @@
+A simple video content factory — an agentic workflow that can take an idea, generate scripts/prompts, create or coordinate visual/video assets, and organize the production process.  Web App.  Use frameworks, such as Bootstrap for the frontend and FastAPI+SQLite for the backend.  Start with a small set of applications and companies as seed data.
