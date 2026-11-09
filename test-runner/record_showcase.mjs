@@ -512,12 +512,11 @@ async function main() {
         const cardThumbWebP = path.join(DEMOS_DIR, 'thumb.webp');
         await generateWebPThumbnail(helperBrowser, sourceStill, cardThumbWebP);
 
-        // Copy thumbnail into netfix / beta-livive-net / livive-net thumbnails directories
+        // Copy thumbnail into the backend source and the public www checkout
         const rootThumb = path.resolve(REPO_ROOT, '../thumbnails/vid-factory.webp');
-        const betaThumb = path.resolve(REPO_ROOT, '../beta-livive-net/thumbnails/vid-factory.webp');
-        const liviveThumb = path.resolve(REPO_ROOT, '../livive-net/thumbnails/vid-factory.webp');
+        const wwwThumb = path.resolve(REPO_ROOT, '../www-livive-net/thumbnails/vid-factory.webp');
 
-        for (const tPath of [rootThumb, betaThumb, liviveThumb]) {
+        for (const tPath of [rootThumb, wwwThumb]) {
           if (fs.existsSync(path.dirname(tPath))) {
             fs.copyFileSync(cardThumbWebP, tPath);
             console.log(`[Thumbnail] Copied to ${tPath}`);
